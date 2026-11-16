@@ -1,0 +1,42 @@
+# Native build products (CMake)
+/build/
+/build-*/
+cmake-build-*/
+/dist/
+
+# MSVC / GCC intermediates
+*.obj
+*.o
+*.d
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.so
+*.so.*
+*.dylib
+*.a
+
+# .NET build products
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+
+# Generated media (the engine writes MP4/PNG outputs)
+/out/
+/outputs/
+/work/
+*.mp4
+*.png
+*.ppm
+
+# ...but keep documentation screenshots
+!/docs/*.png
+
+# Local configuration with machine-specific paths / secrets
+/config/local*.json
+.env
+*.log

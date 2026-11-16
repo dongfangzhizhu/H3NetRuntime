@@ -1,0 +1,12 @@
+# Keep vendored upstream sources byte-identical (no EOL rewriting), so the
+# snapshot can be diffed against h3-spark.c rev a474eca without noise.
+native/engine/** -text
+
+# Windows batch files must keep CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf
+
+*.png binary
+*.mp4 binary
+*.safetensors binary

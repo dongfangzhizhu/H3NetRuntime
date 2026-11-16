@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>H3 Flash · 视频生成</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">H3</span>
+    <span class="title">MiniMax-H3 Flash</span>
+    <span class="badge" id="editionBadge">通用版</span>
+  </div>
+  <div class="meta">
+    <span id="gpuName" class="chip chip-muted">检测设备…</span>
+    <span id="archWarn" class="chip chip-warn" hidden>算力不匹配</span>
+    <span id="modelPath" class="chip chip-muted" title="">模型未加载</span>
+  </div>
+  <div class="topactions">
+    <button class="btn btn-ghost" id="btnPreload" title="预读 DiT 权重，首次生成更快">预热模型</button>
+    <button class="btn btn-ghost" id="btnCache">清缓存</button>
+    <button class="btn btn-ghost" id="btnRefresh">刷新状态</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ------------------------------------------------------------ composer -->
+  <section class="panel composer">
+    <div class="field">
+      <div class="labelrow">
+        <label for="prompt">提示词</label>
+        <span class="hint" id="promptHint">中文/英文均可，越具体越好</span>
+      </div>
+      <textarea id="prompt" rows="5" spellcheck="false"
+        placeholder="例：一只橘猫坐在窗台上，午后的阳光透过百叶窗，镜头缓慢推近，画面温暖安静"></textarea>
+    </div>
+
+    <div class="field" id="presetField">
+      <div class="labelrow"><label>规格</label><span class="hint">决定分辨率、时长与采样步数</span></div>
+      <div class="presets" id="presets"></div>
+    </div>
+
+    <div class="field" id="basicField">
+      <div class="labelrow"><label>画面与时长</label></div>
+      <div class="grid2">
+        <label class="control">
+          <span>分辨率</span>
+          <select id="resolution"></select>
+        </label>
+        <label class="control">
+          <span>时长</span>
+          <select id="duration"></select>
+        </label>
+        <label class="control">
+          <span>随机种子</span>
+          <div class="row">
+            <input id="seed" type="number" min="0" step="1" placeholder="随机" />
+            <button class="btn btn-icon" id="btnDice" title="随机">🎲</button>
+          </div>
+        </label>
+        <label class="control">
+          <span>生成方式</span>
+          <select id="mode">
+            <option value="t2v">文生视频</option>
+            <option value="fl2v">首尾帧（FL2VA）</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <div class="field" id="anchorField" hidden>
+      <div class="labelrow"><label>首 / 尾帧</label><span class="hint">可只给首帧或只给尾帧</span></div>
+      <div class="grid2">
+        <div class="dropzone" data-slot="first" tabindex="0">
+          <img hidden alt="首帧" />
+          <span class="dz-text">首帧</span>
+          <button class="dz-clear" hidden title="移除">×</button>
+        </div>
+        <div class="dropzone" data-slot="last" tabindex="0">
+          <img hidden alt="尾帧" />
+          <span class="dz-text">尾帧</span>
+          <button class="dz-clear" hidden title="移除">×</button>
+        </div>
+      </div>
+    </div>
+
+    <label class="switch">
+      <input type="checkbox" id="livePreview" checked />
+      <span>实时预览（每 N 帧回传一张）</span>
+    </label>
+
+    <!-- advanced -->
+    <details class="advanced" id="advancedPanel">
+      <summary>高级参数</summary>
+
+      <div class="advbody">
+        <div class="labelrow"><label>采样</label></div>
+        <div class="grid2">
+          <label class="control">
+            <span>宽</span>
+            <input id="advWidth" type="number" min="32" step="32" />
+          </label>
+          <label class="control">
+            <span>高</span>
+            <input id="advHeight" type="number" min="32" step="32" />
+          </label>
+          <label class="control">
+            <span>帧数</span>
+            <input id="advFrames" type="number" min="22" step="17" />
+          </label>
+          <label class="control">
+            <span>步数</span>
+            <input id="advSteps" type="number" min="2" max="1000" step="1" />
+          </label>
+          <label class="control">
+            <span>DiT 层数</span>
+            <input id="advDitLayers" type="number" min="35" max="50" step="1" />
+          </label>
+          <label class="control">
+            <span>去噪复用</span>
+            <input id="advDenoiseReuse" type="number" min="1" max="3" step="1" />
+          </label>
+          <label class="control">
+            <span>核心复用</span>
+            <input id="advCoreReuse" type="number" min="1" max="6" step="1" />
+          </label>
+          <label class="control">
+            <span>参考图尺寸</span>
+            <select id="advRefSize">
+              <option value="">默认</option>
+              <option value="match">match</option>
+              <option value="256">256</option>
+              <option value="512">512</option>
+              <option value="768">768</option>
+              <option value="1024">1024</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="labelrow"><label>内部分辨率</label><span class="hint">同比例、不大于输出画布</span></div>
+        <div class="grid2">
+          <label class="control">
+            <span>渲染宽</span>
+            <input id="advRenderWidth" type="number" min="0" step="32" placeholder="0 = 关闭" />
+          </label>
+          <label class="control">
+            <span>渲染高</span>
+            <input id="advRenderHeight" type="number" min="0" step="32" placeholder="0 = 关闭" />
+          </label>
+        </div>
+
+        <div class="labelrow"><label>引擎开关</label></div>
+        <div class="toggles">
+          <label class="switch"><input type="checkbox" id="advPdd8" checked /><span>PDD 8 步蒸馏</span></label>
+          <label class="switch"><input type="checkbox" id="advTokenReduction" /><span>token_reduction</span></label>
+          <label class="switch"><input type="checkbox" id="advSolAttn" /><span>sol_attn</span></label>
+          <label class="switch"><input type="checkbox" id="advFbc" /><span>fbc</span></label>
+          <label class="switch"><input type="checkbox" id="advSsd" /><span>ssd_streaming</span></label>
+          <label class="switch"><input type="checkbox" id="advInt8RowFc2" /><span>int8_row_fc2</span></label>
+          <label class="switch"><input type="checkbox" id="advRefRope" /><span>use_reference_rope</span></label>
+          <label class="switch"><input type="checkbox" id="advPreviewDenoise" /><span>preview_denoise（每步预览）</span></label>
+        </div>
+
+        <div class="labelrow">
+          <label>参考素材（Ref2VA）</label>
+          <span class="hint" id="refHint"></span>
+        </div>
+        <div class="reflist" id="refList"></div>
+        <button class="btn btn-ghost btn-sm" id="btnAddRef">+ 添加参考图 / 视频 / 音频</button>
+
+        <div class="labelrow"><label>模型包</label></div>
+        <div class="row">
+          <select id="packSelect"></select>
+          <button class="btn btn-ghost btn-sm" id="btnSwitchPack">切换</button>
+        </div>
+
+        <label class="switch"><input type="checkbox" id="advRawJson" /><span>显示原始结果 JSON</span></label>
+      </div>
+    </details>
+
+    <div class="submitrow">
+      <button class="btn btn-primary" id="btnGenerate">生成视频</button>
+      <button class="btn btn-danger" id="btnCancel" hidden>取消</button>
+    </div>
+    <div class="alert" id="alert" hidden></div>
+  </section>
+
+  <!-- --------------------------------------------------------------- stage -->
+  <section class="panel stage">
+    <div class="viewport" id="viewport">
+      <div class="placeholder" id="placeholder">
+        <div class="ph-icon">▶</div>
+        <p>生成结果会出现在这里</p>
+        <p class="ph-sub">左侧填写提示词后点击「生成视频」</p>
+      </div>
+      <img id="previewImg" alt="实时预览" hidden />
+      <video id="resultVideo" controls playsinline hidden></video>
+      <div class="vbadge" id="vbadge" hidden></div>
+    </div>
+
+    <div class="progress">
+      <div class="bar"><div class="fill" id="barFill"></div></div>
+      <div class="progressmeta">
+        <span id="phaseText">空闲</span>
+        <span id="progressText"></span>
+      </div>
+    </div>
+
+    <div class="resultbar" id="resultbar" hidden>
+      <a class="btn btn-ghost btn-sm" id="btnDownload" download>下载 MP4</a>
+      <span class="chip" id="chipRes"></span>
+      <span class="chip" id="chipFrames"></span>
+      <span class="chip" id="chipFps"></span>
+      <span class="chip" id="chipElapsed"></span>
+      <span class="chip" id="chipSeed"></span>
+    </div>
+
+    <details class="phases" id="phasePanel" hidden>
+      <summary>阶段耗时</summary>
+      <div class="phaselist" id="phaseList"></div>
+    </details>
+
+    <details class="phases" id="rawPanel" hidden>
+      <summary>原始 JSON</summary>
+      <pre id="rawJson"></pre>
+    </details>
+  </section>
+</main>
+
+<!-- ------------------------------------------------------------- history -->
+<section class="panel history">
+  <div class="historyhead">
+    <h2>历史记录</h2>
+    <span class="hint" id="historyCount"></span>
+  </div>
+  <div class="gallery" id="gallery">
+    <p class="empty">还没有生成记录</p>
+  </div>
+</section>
+
+<input type="file" id="filePicker" hidden accept="image/*,video/*,audio/*" />
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

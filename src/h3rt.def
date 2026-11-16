@@ -1,0 +1,21 @@
+; Explicit export list: the public C ABI of h3rt. cJSON is linked privately
+; into the DLL, so a .def keeps its symbols out of the ABI surface.
+LIBRARY h3rt
+EXPORTS
+    h3rt_version
+    h3rt_abi_version
+    h3rt_status_text
+    h3rt_build_info
+    h3rt_free_string
+    h3rt_create
+    h3rt_destroy
+    h3rt_last_error
+    h3rt_device_info
+    h3rt_model_info
+    h3rt_cache_info
+    h3rt_cache_clear
+    h3rt_set_text_cache_dir
+    h3rt_preload
+    h3rt_generate
+    h3rt_cancel
+    h3rt_is_cancelled

@@ -1,0 +1,11 @@
+{
+  "_comment": "Template for H3RuntimeOptions.ConfigPath / the sample's --config flag. Edit the paths for your machine. Only h3_dir is needed by h3rt (the other packs belong to h3-spark.c's multi-model server and are optional here).",
+  "windows": {
+    "h3_dir": "D:/AI/convert/minimax/h3-models/pdd8",
+    "text_cache_dir": "D:/AI/convert/minimax/h3-dotnet-runtime/.cache/h3-text"
+  },
+  "linux": {
+    "h3_dir": "~/h3-models/pdd8",
+    "text_cache_dir": "~/.cache/h3-text"
+  }
+}
