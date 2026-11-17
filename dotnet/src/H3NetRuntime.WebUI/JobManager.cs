@@ -13,6 +13,11 @@ public sealed class JobManager : IDisposable
 {
     private const int MaxPixels = 768 * 1344;
     private const int MinAlignedFrames = 22;
+    /* The engine's Ref2VA path refuses anything larger. */
+    private const int MaxReferenceImages = 9;
+    private const int MaxReferenceVideos = 3;
+    private const int MaxReferenceAudios = 3;
+    private const int MaxReferences = 12;
 
     private readonly WebUiOptions _options;
     private readonly RuntimeHost _host;
@@ -61,7 +66,8 @@ public sealed class JobManager : IDisposable
         Presets.ApplyDefaults(request, preset);
         if (!_options.Advanced) Presets.Force(request, preset);
 
-        Validate(request);
+        ModeInfo mode = GenerationModes.Normalize(request);
+        Validate(request, mode);
 
         string id = NewId();
         string directory = Path.Combine(_options.OutputDir, id);
@@ -74,6 +80,7 @@ public sealed class JobManager : IDisposable
             Request = request,
             Prompt = request.Prompt!.Trim(),
             Preset = preset.Id,
+            Mode = mode.Id,
             CreatedAt = DateTimeOffset.Now,
             Status = "queued",
             LivePreview = request.LivePreview ?? true,
@@ -81,15 +88,15 @@ public sealed class JobManager : IDisposable
             Directory = directory
         };
         _jobs[id] = job;
-        _logger.LogInformation("queued {Job} {Width}x{Height} {Frames}f preset={Preset}",
-            id, request.Width, request.Height, request.Frames, preset.Id);
+        _logger.LogInformation("queued {Job} {Width}x{Height} {Frames}f preset={Preset} mode={Mode}",
+            id, request.Width, request.Height, request.Frames, preset.Id, mode.Id);
 
         if (!_queue.Writer.TryWrite(job))
             throw new InvalidOperationException("任务队列已关闭。");
         return Snapshot(job);
     }
 
-    private static void Validate(GenerateApiRequest request)
+    private void Validate(GenerateApiRequest request, ModeInfo mode)
     {
         int width = request.Width ?? 0;
         int height = request.Height ?? 0;
@@ -111,6 +118,62 @@ public sealed class JobManager : IDisposable
             throw new ArgumentException("采样步数必须在 2..1000 之间。");
         if (request.Pdd8 == true && steps != 8)
             throw new ArgumentException("PDD 8 步蒸馏必须正好 8 步采样。");
+
+        if (mode.Id == GenerationModes.FirstLastFrame)
+        {
+            bool hasFirst = !string.IsNullOrWhiteSpace(request.FirstFrame);
+            bool hasLast = !string.IsNullOrWhiteSpace(request.LastFrame);
+            if (!hasFirst && !hasLast)
+                throw new ArgumentException("首尾帧模式至少需要一张首帧或尾帧。");
+            if (hasFirst && ResolveUpload(request.FirstFrame) is null)
+                throw new ArgumentException("首帧文件不存在，请重新上传。");
+            if (hasLast && ResolveUpload(request.LastFrame) is null)
+                throw new ArgumentException("尾帧文件不存在，请重新上传。");
+        }
+
+        if (mode.RequiresRef2Va)
+        {
+            (int images, int videos, int audios) = CountReferences(request);
+            if (images + videos + audios == 0)
+                throw new ArgumentException("多图参考模式至少需要一张参考图。");
+            if (images > MaxReferenceImages)
+                throw new ArgumentException($"参考图最多 {MaxReferenceImages} 张。");
+            if (videos > MaxReferenceVideos)
+                throw new ArgumentException($"参考视频最多 {MaxReferenceVideos} 段。");
+            if (audios > MaxReferenceAudios)
+                throw new ArgumentException($"参考音频最多 {MaxReferenceAudios} 段。");
+            if (images + videos + audios > MaxReferences)
+                throw new ArgumentException($"参考素材总数最多 {MaxReferences} 个。");
+            if (!_host.Ref2VaAvailable)
+                throw new ArgumentException(
+                    "当前模型包不含 Ref2VA 权重，无法做多图参考。" +
+                    "请先按“模型下载指引”补上 Ref2VA/transformer，或改用文生视频 / 首尾帧模式。");
+        }
+    }
+
+    private static (int Images, int Videos, int Audios) CountReferences(GenerateApiRequest request)
+    {
+        int images = 0, videos = 0, audios = 0;
+        if (request.References is { Count: > 0 })
+        {
+            foreach (ReferenceInput reference in request.References)
+            {
+                switch ((reference.Kind ?? "image").ToLowerInvariant())
+                {
+                    case "image": images++; break;
+                    case "video": videos++; break;
+                    case "audio": audios++; break;
+                    case "video_audio":
+                    case "video+audio": videos++; audios++; break;
+                    default: images++; break;
+                }
+            }
+        }
+        if (request.ReferenceImages is { Count: > 0 }) images += request.ReferenceImages.Count;
+        if (!string.IsNullOrWhiteSpace(request.ReferenceImage)) images++;
+        if (!string.IsNullOrWhiteSpace(request.ReferenceVideo)) videos++;
+        if (!string.IsNullOrWhiteSpace(request.ReferenceAudio)) audios++;
+        return (images, videos, audios);
     }
 
     // ---------------------------------------------------------------- warm up
@@ -274,7 +337,11 @@ public sealed class JobManager : IDisposable
             job.StartedAt = DateTimeOffset.Now;
             job.StartedTicks = Environment.TickCount64;
             job.Phase = "准备中";
+            job.Progress.Configure(job.Mode, job.Request.Frames ?? 56,
+                job.Request.Steps ?? 8, job.Request.DitLayers ?? 50);
+            job.Progress.Update("prepare", 0, 1, job.StartedTicks);
         }
+        _logger.LogInformation("[{Job}] {Line}", job.Id, "准备       -         0.0%  0.0s");
 
         H3GenerateRequest native = BuildNativeRequest(job);
         var progress = new InlineProgress<H3Progress>(value => OnProgress(job, value));
@@ -397,12 +464,19 @@ public sealed class JobManager : IDisposable
 
     private void OnProgress(Job job, H3Progress value)
     {
+        string? line;
         lock (job.Sync)
         {
             job.Phase = value.Phase;
             job.Completed = value.Completed;
             job.Total = value.Total;
+            line = job.Progress.Update(value.Phase, value.Completed, value.Total,
+                job.StartedTicks);
         }
+        // Console keeps the timeline: the page has the bar, the log has "which
+        // stage was slow" without opening devtools.
+        if (line is not null)
+            _logger.LogInformation("[{Job}] {Line}", job.Id, line);
     }
 
     private static void OnFrame(PreviewPipeline preview, Job job, H3Frame frame)
@@ -428,6 +502,7 @@ public sealed class JobManager : IDisposable
             job.VideoUrl = videoUrl;
             job.Phase = "完成";
             job.Completed = job.Total;
+            job.Progress.Finish();
             preview = job.Preview;
             if (preview is not null) job.PosterUrl = preview.PosterUrl;
         }
@@ -493,6 +568,25 @@ public sealed class JobManager : IDisposable
 
     private static string NewId() => Guid.NewGuid().ToString("N")[..10];
 
+    /// <summary>
+    /// Remaining time. <see cref="JobProgress"/> already smooths the rate and
+    /// stops the estimate from climbing once the run is under way, so the page
+    /// shows exactly the number the console prints. A plain elapsed/overall
+    /// ratio is only the fallback for the first few seconds.
+    /// </summary>
+    private static double? EstimateEta(Job job)
+    {
+        if (job.StartedTicks == 0 || job.FinishedTicks != 0) return null;
+        double overall = job.Progress.Overall;
+        if (overall < 0.05) return null;
+        double elapsed = Environment.TickCount64 - job.StartedTicks;
+        if (elapsed < 3000) return null;
+        double eta = job.Progress.EtaSeconds;
+        double remaining = eta > 0 ? eta * 1000.0
+            : elapsed * (1 - overall) / overall;
+        return Math.Round(Math.Min(remaining, TimeSpan.FromHours(6).TotalMilliseconds));
+    }
+
     // -------------------------------------------------------------- snapshot
 
     private static JobView Snapshot(Job job)
@@ -506,6 +600,7 @@ public sealed class JobManager : IDisposable
                 Status = job.Status,
                 Prompt = job.Prompt,
                 Preset = job.Preset,
+                Mode = job.Mode,
                 Request = job.Request,
                 CreatedAt = job.CreatedAt,
                 StartedAt = job.StartedAt,
@@ -521,16 +616,21 @@ public sealed class JobManager : IDisposable
                     : new JobProgressView
                     {
                         Phase = job.Phase,
+                        Stage = job.Progress.Label.Length > 0
+                            ? job.Progress.Label
+                            : job.Phase,
                         Completed = job.Completed,
                         Total = job.Total,
                         Fraction = job.Total > 0
                             ? Math.Clamp((double)job.Completed / job.Total, 0, 1)
                             : null,
+                        Overall = Math.Round(job.Progress.Overall, 4),
                         ElapsedMs = job.StartedTicks == 0
                             ? 0
                             : Math.Round((double)((job.FinishedTicks != 0
                                 ? job.FinishedTicks
-                                : Environment.TickCount64) - job.StartedTicks))
+                                : Environment.TickCount64) - job.StartedTicks)),
+                        EtaMs = EstimateEta(job)
                     }
             };
             view.PreviewUrl = job.Preview?.PreviewUrl;
@@ -566,6 +666,7 @@ public sealed class JobManager : IDisposable
         public GenerateApiRequest Request = new();
         public string Prompt = string.Empty;
         public string? Preset;
+        public string Mode = GenerationModes.Text;
         public DateTimeOffset CreatedAt;
         public DateTimeOffset? StartedAt;
         public DateTimeOffset? FinishedAt;
@@ -573,6 +674,7 @@ public sealed class JobManager : IDisposable
         public string Phase = string.Empty;
         public int Completed;
         public int Total;
+        public readonly JobProgress Progress = new();
         public long StartedTicks;
         public long FinishedTicks;
         public H3GenerateResult? Result;

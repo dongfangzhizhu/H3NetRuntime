@@ -30,7 +30,7 @@ endif()
 
 set(E "${H3_ENGINE_DIR}")
 set(H3_LIB_SOURCES
-    h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c
+    h3.c h3_host.c h3_safetensors.c h3_weights.c h3_gguf.c h3_text_encoder.c
     h3_dit_schedule.c h3_dit.c h3_lora.c h3_config.c h3_pddheads.c
     h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c
     h3_terminal.c h3_vision_encoder.c h3_multimodal.c h3_device.c
@@ -54,7 +54,8 @@ list(TRANSFORM H3_WIN_SOURCES PREPEND "${E}/")
 add_library(h3rt SHARED
     ${H3_LIB_SOURCES}
     ${H3_CUDA_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/h3rt.c")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/h3rt.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/h3rt_links.c")
 if(WIN32)
     target_sources(h3rt PRIVATE ${H3_WIN_SOURCES}
         "${CMAKE_CURRENT_SOURCE_DIR}/src/h3rt.def")
@@ -124,6 +125,9 @@ set_target_properties(h3rt_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 if(WIN32)
     target_compile_definitions(h3rt_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    # Same source encoding as the library, so a non-ASCII byte in a header or a
+    # future UTF-8 prompt literal does not trip C4819 on a GBK code page.
+    target_compile_options(h3rt_smoke PRIVATE /utf-8)
     target_link_options(h3rt_smoke PRIVATE "/STACK:8388608")
 endif()
 

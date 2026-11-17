@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "H3NetRuntime.WebUI": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:38309;http://localhost:38310"
+    }
+  }
+}

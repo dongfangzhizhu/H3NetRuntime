@@ -1,0 +1,11 @@
+{
+  "_comment": "模型包路径表。WebUI 与 h3rt 都会读这个文件：H3:ConfigPath 指向它，ModelLocator 从这里取 h3_dir。把下面的示例路径改成你机器上的实际路径；H3_MODEL_DIR 环境变量优先级更高。",
+  "windows": {
+    "h3_dir": "C:/models/ComfyUI_MiniMax-H3-V8/ComfyUI/models",
+    "text_cache_dir": ".cache/h3-text"
+  },
+  "linux": {
+    "h3_dir": "~/h3-models/ComfyUI_MiniMax-H3-V8/ComfyUI/models",
+    "text_cache_dir": "~/.cache/h3-text"
+  }
+}

@@ -64,6 +64,9 @@ typedef struct {
 typedef struct {
     h3_gpu *gpu;
     h3_weight_store *weights;
+    /* Decoder depth read from the checkpoint: 36 in the original release, 24
+     * in the pruned ComfyUI build. */
+    int layers;
     vae_block blocks[LAYERS];
     h3_gpu_tensor *post_w;
     h3_gpu_tensor *post_b;
@@ -195,9 +198,41 @@ static int convrot_scale_name(const char *name, char *out, size_t size) {
     return written > 0 && (size_t)written < size;
 }
 
+/* The ComfyUI release renames the decoder stack `decoder.transformer_blocks`
+ * to `decoder.blocks` and prunes it from 36 layers to 24, so the prefix and the
+ * depth both come from the file instead of the build. */
+static const char *resolve_vae_name(const h3_weight_store *weights,
+                                    const char *name, char *buffer,
+                                    size_t size) {
+    if (h3_weight_find(weights, name, NULL)) return name;
+    static const char from[] = "decoder.transformer_blocks.";
+    static const char to[] = "decoder.blocks.";
+    if (strncmp(name, from, sizeof(from) - 1) != 0) return name;
+    int written = snprintf(buffer, size, "%s%s", to,
+                           name + (sizeof(from) - 1));
+    if (written <= 0 || (size_t)written >= size) return name;
+    return h3_weight_find(weights, buffer, NULL) ? buffer : name;
+}
+
+static int probe_layers(const h3_weight_store *weights) {
+    int count = 0;
+    for (int index = 0; index < LAYERS; index++) {
+        char name[96], alias[96];
+        snprintf(name, sizeof(name),
+                 "decoder.transformer_blocks.%d.norm1.weight", index);
+        if (!h3_weight_find(weights, resolve_vae_name(weights, name, alias,
+                                                      sizeof(alias)), NULL))
+            break;
+        count = index + 1;
+    }
+    return count;
+}
+
 static h3_gpu_tensor *load_f32(vae_context *vae, const char *name, int ndim,
                                const uint64_t *shape, char *error,
                                size_t error_size) {
+    char alias[192];
+    name = resolve_vae_name(vae->weights, name, alias, sizeof(alias));
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(vae->weights, name, &header);
     if (!tensor) {
@@ -308,7 +343,8 @@ static void free_block(vae_block *block) {
 
 static void cleanup(vae_context *vae) {
     if (!vae) return;
-    for (int index = 0; index < LAYERS; index++) free_block(&vae->blocks[index]);
+    for (int index = 0; index < vae->layers; index++)
+        free_block(&vae->blocks[index]);
     free_tensor(&vae->post_w); free_tensor(&vae->post_b);
     free_tensor(&vae->embed_w); free_tensor(&vae->embed_b);
     free_tensor(&vae->registers); free_tensor(&vae->norm_out_w);
@@ -474,11 +510,24 @@ static int load_latent_normalization(const char *weight_directory,
     snprintf(path, path_size, "%s/../config.json", weight_directory);
     FILE *file = fopen(path, "rb");
     if (!file || fseek(file, 0, SEEK_END)) {
-        fail(error, error_size, "cannot open video VAE config %s: %s", path,
-             strerror(errno));
+        /* The ComfyUI release ships no config.json: the VideoVAE keeps its
+         * latent normalization as `latents_mean` / `latents_std` tensors in
+         * the checkpoint itself, which is where ComfyUI reads them too. */
         if (file) fclose(file);
         free(path);
-        return 0;
+        int ok = h3_weight_read_f32_vector(weight_directory, "latents_mean",
+                                           mean, LATENT_CHANNELS, error,
+                                           error_size) &&
+                 h3_weight_read_f32_vector(weight_directory, "latents_std",
+                                           deviation, LATENT_CHANNELS, error,
+                                           error_size);
+        if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+            if (deviation[channel] <= 0.0f) {
+                fail(error, error_size,
+                     "video VAE latent standard deviation is invalid");
+                return 0;
+            }
+        return ok;
     }
     long end = ftell(file);
     if (end < 1 || end > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {
@@ -707,13 +756,13 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
     free_tensor(&vae->embed_w); free_tensor(&vae->embed_b);
     free_tensor(&vae->registers);
 
-    for (int index = 0; index < LAYERS; index++) {
+    for (int index = 0; index < vae->layers; index++) {
         if (!load_block(vae, index, error, error_size)) return 0;
         OP(h3_gpu_begin(vae->gpu), "begin video VAE transformer block");
         if (!run_block(vae, index, error, error_size)) return 0;
         OP(h3_gpu_submit(vae->gpu), "submit video VAE transformer block");
         free_block(&vae->blocks[index]);
-        if (progress) progress(index + 1, LAYERS, progress_opaque);
+        if (progress) progress(index + 1, vae->layers, progress_opaque);
     }
     if (!load_output_weights(vae, error, error_size)) return 0;
     OP(h3_gpu_begin(vae->gpu), "begin video VAE output projection");
@@ -730,15 +779,43 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
     return 1;
 }
 
+static int vae_open_weights(vae_context *vae, const char *weight_directory,
+                            char *error, size_t error_size) {
+    vae->weights = h3_weight_store_open(weight_directory, error, error_size);
+    if (!vae->weights) return 0;
+    vae->layers = probe_layers(vae->weights);
+    if (!vae->layers) {
+        fail(error, error_size,
+             "%s: no decoder.transformer_blocks.N.norm1.weight (nor the "
+             "decoder.blocks.N alias); not a MiniMax H3 video VAE",
+             weight_directory);
+        return 0;
+    }
+    /* An int8_convrot checkpoint carries the per-row scale sidecar; the
+     * original release has none, so H3_INT8_VAE alone decides there. */
+    if (!vae->int8_vae) {
+        char name[96], alias[96];
+        snprintf(name, sizeof(name),
+                 "decoder.transformer_blocks.0.attn.to_qkv.weight_scale");
+        vae->int8_vae = h3_weight_find(
+            vae->weights, resolve_vae_name(vae->weights, name, alias,
+                                           sizeof(alias)), NULL) != NULL;
+    }
+    if (!getenv("H3_QUIET"))
+        fprintf(stderr, "h3: video VAE depth: %d blocks%s\n", vae->layers,
+                vae->int8_vae ? " (INT8 ConvRot)" : "");
+    return 1;
+}
+
 static int load_resident_weights(vae_context *vae,
                                  h3_video_vae_progress progress,
                                  void *progress_opaque, char *error,
                                  size_t error_size) {
     dtype_stats_reset();
     if (!load_input_weights(vae, error, error_size)) return 0;
-    for (int index = 0; index < LAYERS; index++) {
+    for (int index = 0; index < vae->layers; index++) {
         if (!load_block(vae, index, error, error_size)) return 0;
-        if (progress) progress(index + 1, LAYERS, progress_opaque);
+        if (progress) progress(index + 1, vae->layers, progress_opaque);
     }
     if (!load_output_weights(vae, error, error_size)) return 0;
     dtype_stats_report("resident video VAE");
@@ -777,7 +854,7 @@ static int run_resident_tile(vae_context *vae, char *error,
     OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
         (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
        "pack tiled video VAE suffix");
-    for (int index = 0; index < LAYERS; index++)
+    for (int index = 0; index < vae->layers; index++)
         if (!run_block(vae, index, error, error_size)) {
             h3_gpu_tensor_free(zero);
             return 0;
@@ -1051,6 +1128,8 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                                 int latent_time, int chunk,
                                 int selected_frame,
                                 h3_video_frames *output,
+                                h3_video_vae_progress progress,
+                                void *progress_opaque, int *done, int total,
                                 char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
     if (!decoder || !normalized_latent || !output || latent_time < 7 ||
@@ -1096,6 +1175,7 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
             if (ok) {
                 int index = tile_y * decoder->x_axis.count + tile_x;
                 tiles[index] = tile.rgb;
+                if (progress) progress(++*done, total, progress_opaque);
             }
         }
     if (ok) ok = stitch_tiles(tiles, &decoder->y_axis, &decoder->x_axis,
@@ -1150,9 +1230,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
                                   vae->latent_w);
         vae->sequence = vae->patches + SUFFIX;
         vae->int8_vae = env_on("H3_INT8_VAE");
-        vae->weights = h3_weight_store_open(weight_directory,
-                                             error, error_size);
-        if (vae->weights)
+        if (vae_open_weights(vae, weight_directory, error, error_size))
             vae->gpu = h3_gpu_create(shader_source_path, error, error_size);
         if (vae->gpu) {
             h3_gpu_profile_set_label(vae->gpu, "resident video VAE decoder");
@@ -1190,8 +1268,8 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
     int global_frame = chunk * 17 + local_frame;
     if (global_frame >= output_frames) global_frame = output_frames - 1;
     int ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
-                                  chunk, local_frame, output,
-                                  error, error_size);
+                                  chunk, local_frame, output, NULL, NULL,
+                                  NULL, 0, error, error_size);
     if (ok) *output_frame_index = global_frame;
     return ok;
 }
@@ -1199,6 +1277,7 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
 int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
+                        h3_video_vae_progress progress, void *progress_opaque,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
     if (error && error_size) error[0] = '\0';
@@ -1223,11 +1302,15 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
         return 0;
     }
     int ok = 1;
+    int tiles_done = 0;
+    int tiles_total = chunks * decoder->y_axis.count * decoder->x_axis.count;
+    if (progress) progress(0, tiles_total, progress_opaque);
     for (int chunk = 0; chunk < chunks && ok; chunk++) {
         h3_video_frames decoded;
         memset(&decoded, 0, sizeof(decoded));
         ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
-                                  chunk, -1, &decoded, error, error_size);
+                                  chunk, -1, &decoded, progress, progress_opaque,
+                                  &tiles_done, tiles_total, error, error_size);
         if (!ok) break;
         if (chunk) for (int frame = 0; frame < 5; frame++) {
             float alpha = (float)frame / 5.0f;
@@ -1300,8 +1383,7 @@ static int decode_chunked(const char *weight_directory,
     vae.patches = (uint32_t)(CHUNK_LATENT_TIME * vae.latent_h * vae.latent_w);
     vae.sequence = vae.patches + SUFFIX;
     vae.int8_vae = env_on("H3_INT8_VAE");
-    vae.weights = h3_weight_store_open(weight_directory, error, error_size);
-    if (vae.weights)
+    if (vae_open_weights(&vae, weight_directory, error, error_size))
         vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu) {
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
@@ -1460,8 +1542,7 @@ int h3_video_vae_decode(const char *weight_directory,
         if (!ok) h3_video_frames_free(output);
         return ok;
     }
-    vae.weights = h3_weight_store_open(weight_directory, error, error_size);
-    if (!vae.weights) return 0;
+    if (!vae_open_weights(&vae, weight_directory, error, error_size)) return 0;
     vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu) {
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");

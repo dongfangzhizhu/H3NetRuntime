@@ -357,11 +357,26 @@ static int load_normalization(encoder_context *encoder,
     snprintf(path, path_size, "%s/../config.json", weight_directory);
     FILE *file = fopen(path, "rb");
     if (!file || fseek(file, 0, SEEK_END)) {
-        fail(error, error_size, "cannot open video VAE config %s: %s", path,
-             strerror(errno));
+        /* The ComfyUI release ships no config.json: the VideoVAE keeps its
+         * latent normalization as `latents_mean` / `latents_std` tensors in
+         * the checkpoint itself, which is where ComfyUI reads them too. */
         if (file) fclose(file);
         free(path);
-        return 0;
+        int ok = h3_weight_read_f32_vector(weight_directory, "latents_mean",
+                                           encoder->latent_mean,
+                                           LATENT_CHANNELS, error,
+                                           error_size) &&
+                 h3_weight_read_f32_vector(weight_directory, "latents_std",
+                                           encoder->latent_std,
+                                           LATENT_CHANNELS, error,
+                                           error_size);
+        if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+            if (encoder->latent_std[channel] <= 0.0f) {
+                fail(error, error_size,
+                     "video VAE latent deviation is invalid");
+                return 0;
+            }
+        return ok;
     }
     long end = ftell(file);
     if (end < 1 || end > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {

@@ -26,7 +26,8 @@ builder.Configuration.AddCommandLine(args, switchMappings);
 
 var options = new WebUiOptions();
 builder.Configuration.GetSection("H3").Bind(options);
-options.Normalize(Directory.GetCurrentDirectory());
+// Working dirs follow the launch directory; model paths follow appsettings.
+options.Normalize(Directory.GetCurrentDirectory(), AppContext.BaseDirectory);
 
 builder.WebHost.UseUrls($"http://{options.Host}:{options.Port}");
 builder.WebHost.ConfigureKestrel(kestrel => kestrel.Limits.MaxRequestBodySize = 512L * 1024 * 1024);
@@ -46,6 +47,14 @@ WebApplication app = builder.Build();
 var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("startup");
 startupLogger.LogInformation("H3 WebUI edition={Edition} port={Port} model={Model}",
     options.Edition, options.Port, options.ModelDir ?? "(auto)");
+
+// Print the resolved component paths before the first request: the engine
+// loads whatever these point at, and a wrong pack is otherwise only visible as
+// a bad video an hour later.
+{
+    RuntimeHost probe = app.Services.GetRequiredService<RuntimeHost>();
+    foreach (string line in probe.Discovery.Describe()) startupLogger.LogInformation("{Line}", line);
+}
 
 var jobs = app.Services.GetRequiredService<JobManager>();
 jobs.Start();
@@ -69,24 +78,43 @@ app.UseStaticFiles(new StaticFileOptions
 
 // ------------------------------------------------------------------- config
 
-app.MapGet("/api/config", (WebUiOptions o, RuntimeHost host) => new ConfigResponse
+app.MapGet("/api/config", (WebUiOptions o, RuntimeHost host) =>
 {
-    Edition = o.Edition,
-    AdvancedEnabled = o.Advanced,
-    Version = H3Runtime.Version,
-    AbiVersion = H3Runtime.AbiVersion,
-    ModelLoaded = host.IsLoaded,
-    ModelError = host.LastError,
-    ModelDir = host.ModelDir,
-    OutputDir = o.OutputDir.Replace('\\', '/'),
-    BuildInfoJson = H3Runtime.BuildInfoJson,
-    Presets = Presets.All.ToList(),
-    Resolutions = Presets.Resolutions.ToList(),
-    FrameChoices = Presets.FrameChoices.ToList(),
-    Packs = host.ScanPacks(),
-    UploadEnabled = true,
-    MaxFrames = 362,
-    DefaultPort = o.Port
+    ModelDiscovery discovery = host.Discovery;
+    return new ConfigResponse
+    {
+        Edition = o.Edition,
+        AdvancedEnabled = o.Advanced,
+        Version = H3Runtime.Version,
+        AbiVersion = H3Runtime.AbiVersion,
+        ModelLoaded = host.IsLoaded,
+        // The engine has not been touched yet at this point, so the error comes
+        // from the file probe: the shell can explain a missing pack on first paint.
+        ModelError = host.LastError ?? discovery.Error,
+        ModelDir = Slash(discovery.PackDir ?? host.ModelDir),
+        ModelPackDir = Slash(discovery.PackDir ?? string.Empty),
+        OutputDir = Slash(o.OutputDir),
+        BuildInfoJson = H3Runtime.BuildInfoJson,
+        Presets = Presets.All.ToList(),
+        Resolutions = Presets.Resolutions.ToList(),
+        FrameChoices = Presets.FrameChoices.ToList(),
+        Packs = host.ScanPacks(),
+        UploadEnabled = true,
+        MaxFrames = 362,
+        DefaultPort = o.Port,
+        Modes = GenerationModes.All.ToList(),
+        Ref2vaAvailable = discovery.Ref2VaPresent,
+        ModelComponents = discovery.Components.Select(c => new ModelComponentView
+        {
+            Key = c.Key,
+            Label = c.Label,
+            Slot = c.Slot,
+            Path = Slash(c.Path ?? string.Empty),
+            Required = c.Required,
+            Present = c.Present
+        }).ToList(),
+        ModelSearchPaths = discovery.Searched.Select(Slash).ToList()
+    };
 });
 
 app.MapGet("/api/status", (RuntimeHost host, JobManager queue) =>
@@ -196,6 +224,22 @@ app.MapPost("/api/cache/clear", (RuntimeHost host) =>
     }
 });
 
+/// Re-probes the disk after the user drops weights in place; does not touch a
+/// loaded engine, so it is safe to call at any time.
+app.MapPost("/api/model/refresh", (RuntimeHost host) =>
+{
+    host.Refresh();
+    ModelDiscovery discovery = host.Discovery;
+    return Results.Ok(new
+    {
+        usable = discovery.IsUsable,
+        packDir = Slash(discovery.PackDir ?? string.Empty),
+        ref2va = discovery.Ref2VaPresent,
+        error = discovery.Error,
+        missing = discovery.Missing.Select(c => c.Label).ToList()
+    });
+});
+
 // ------------------------------------------------------------------- upload
 
 string[] allowedExtensions =
@@ -270,3 +314,6 @@ app.Lifetime.ApplicationStopping.Register(() =>
 });
 
 app.Run();
+
+/// <summary>Windows paths read better with forward slashes in JSON and HTML.</summary>
+static string Slash(string path) => path.Replace('\\', '/');

@@ -1,0 +1,113 @@
+name: Publish NuGet
+
+# Trusted Publishing: no long-lived NuGet API key is stored in this repository.
+# See docs/RELEASING.md for the one-time setup on nuget.org and in GitHub.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version to publish (e.g. 1.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Pack and push to nuget.org
+    runs-on: ubuntu-latest
+    # Must match the Environment value of the nuget.org trusted publishing policy.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # required for the OIDC token exchanged by NuGet/login@v1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Resolve package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "No version resolved." >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Publishing H3NetRuntime $VERSION"
+
+      - name: Verify checked-in native assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/win-x64/h3rt.dll
+          test -f dist/linux-x64/libh3rt.so
+          test -f assets/tokenizer/tokenizer.json
+          echo "native runtime assets present"
+
+      - name: Restore
+        run: dotnet restore dotnet/H3NetRuntime.sln
+
+      - name: Build
+        run: dotnet build dotnet/H3NetRuntime.sln -c Release --no-restore
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet pack dotnet/src/H3NetRuntime/H3NetRuntime.csproj \
+            -c Release --no-build -p:PackageVersion="$VERSION" -o artifacts
+
+      - name: Verify package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=$(ls artifacts/*.nupkg | head -n 1)
+          unzip -l "$PKG" | grep -E 'runtimes/win-x64/native/h3rt.dll'
+          unzip -l "$PKG" | grep -E 'runtimes/linux-x64/native/libh3rt.so'
+          unzip -l "$PKG" | grep -E 'runtimes/(win|linux)-x64/native/tokenizer/tokenizer.json'
+          unzip -l "$PKG" | grep -E 'PACKAGE.md'
+
+      - name: Resolve nuget.org user
+        shell: bash
+        run: |
+          echo "Publishing as nuget.org user: ${{ vars.NUGET_USER || 'wenlee' }}"
+
+      # The OIDC token is exchanged for a short-lived API key (valid 1 hour).
+      # Request it as late as possible, right before the push.
+      - name: NuGet login (OIDC to temporary API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER || 'wenlee' }}
+
+      - name: NuGet push
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet nuget push "artifacts/*.nupkg" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: Upload published package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg-${{ env.VERSION }}
+          path: artifacts/*.nupkg
+          if-no-files-found: error

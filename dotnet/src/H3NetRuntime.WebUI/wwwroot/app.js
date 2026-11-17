@@ -9,10 +9,13 @@
     config: null,
     status: null,
     presetId: 'balanced',
+    demoId: null,
+    mode: 't2v',
     jobId: null,
     pollTimer: null,
     anchors: { first: null, last: null },
-    refs: [],
+    refImages: [],   // ordered reference images (Ref2VA)
+    refs: [],        // advanced: reference videos / audio
     uploadTarget: null,
     busy: false
   };
@@ -81,6 +84,10 @@
     renderResolutions();
     renderDurations();
     renderPacks();
+    renderModes();
+    renderComponents();
+    placeComponentPanel();
+    updateModelBanner();
 
     if (advanced) {
       $('advancedPanel').open = true;
@@ -93,14 +100,164 @@
       $('advFrames').value = 56;
       $('advRenderWidth').value = 0;
       $('advRenderHeight').value = 0;
-      $('refHint').textContent = config.packs.some((p) => p.hasRef2Va)
+      $('refHint').textContent = config.ref2vaAvailable
         ? '按顺序生效，需要 Ref2VA 权重'
         : '当前模型包不含 Ref2VA，参考素材会被忽略';
     }
 
     selectPreset('balanced', true);
+    renderDemos();
     loadHistory();
     loadStatus();
+  }
+
+  /* ---------------------------------------------------------------- modes */
+
+  function modeList() {
+    return state.config.modes || [];
+  }
+
+  function renderModes() {
+    const container = $('modes');
+    container.innerHTML = '';
+    for (const mode of modeList()) {
+      const button = document.createElement('button');
+      button.className = 'mode';
+      button.dataset.id = mode.id;
+      button.innerHTML = '<b></b><small></small>';
+      button.querySelector('b').textContent = mode.name;
+      button.querySelector('small').textContent = mode.description;
+      button.addEventListener('click', () => selectMode(mode.id));
+      container.appendChild(button);
+    }
+    // ?mode=ref2v opens the UI on a given mode (handy for shortcuts).
+    const requested = new URLSearchParams(location.search).get('mode');
+    selectMode(requested || 't2v', true);
+  }
+
+  function selectMode(id, silent) {
+    const mode = modeList().find((m) => m.id === id) || modeList()[0];
+    if (!mode) return;
+    state.mode = mode.id;
+
+    for (const node of $('modes').children)
+      node.classList.toggle('active', node.dataset.id === mode.id);
+
+    $('anchorField').hidden = mode.id !== 'fl2v';
+    $('refField').hidden = mode.id !== 'ref2v';
+    // Each mode has its own examples, so the card list follows the switch.
+    renderDemos();
+
+    // Reference conditioning is the only mode that needs the second DiT.
+    const blocked = mode.requiresRef2Va && !state.config.ref2vaAvailable;
+    $('modeHint').textContent = blocked
+      ? '缺少 Ref2VA 权重，详见“模型指引”'
+      : mode.requiresRef2Va
+        ? '按顺序参考，越靠前权重越高'
+        : mode.id === 'fl2v'
+          ? '至少给一张首帧或尾帧'
+          : '';
+
+    if (blocked) {
+      toast('当前模型包不含 Ref2VA，多图参考会被拒绝', 'err');
+    } else if (!silent && mode.id === 'ref2v' && state.refImages.length === 0) {
+      // A nudge, not an error: the user still has to pick the images.
+      $('refImageHint').textContent = `按顺序生效，最多 ${maxRefImages()} 张`;
+    }
+  }
+
+  function maxRefImages() {
+    return (state.config && state.config.maxReferenceImages) || 9;
+  }
+
+  /* ---------------------------------------------------------- model health */
+
+  function updateModelBanner() {
+    const config = state.config;
+    if (!config) return;
+    const missing = (config.modelComponents || []).filter((c) => c.required && !c.present);
+    const show = missing.length > 0;
+    $('modelBanner').hidden = !show;
+    if (!show) return;
+
+    $('bannerTitle').textContent = config.modelPackDir
+      ? '模型包不完整'
+      : '还没有找到模型权重';
+    $('bannerText').textContent = config.modelError || '';
+
+    const list = $('bannerMissing');
+    list.innerHTML = '';
+    for (const item of missing) {
+      const row = document.createElement('code');
+      row.textContent = `${item.slot}`;
+      row.title = item.path || '';
+      list.appendChild(row);
+    }
+  }
+
+  function renderComponents() {
+    const container = $('components');
+    if (!container) return;
+    container.innerHTML = '';
+    const items = state.config.modelComponents || [];
+    if (items.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'hint';
+      empty.textContent = '没有解析到组件路径';
+      container.appendChild(empty);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'component' + (item.present ? '' : ' missing');
+      const mark = document.createElement('i');
+      mark.textContent = item.present ? '✓' : '✗';
+      const name = document.createElement('span');
+      name.textContent = item.label;
+      const path = document.createElement('code');
+      path.textContent = item.present ? item.path : `${item.slot} 缺失`;
+      path.title = item.path || '';
+      row.append(mark, name, path);
+      container.appendChild(row);
+    }
+  }
+
+  async function recheckModel() {
+    try {
+      toast('正在重新检测模型…');
+      const result = await postJson('/api/model/refresh', {});
+      await refreshConfig();
+      updateModelBanner();
+      renderComponents();
+      if (result.usable) toast('已找到模型权重', 'ok');
+      else toast(result.error || '仍未找到完整权重', 'err');
+    } catch (error) {
+      toast('检测失败：' + error.message, 'err');
+    }
+  }
+
+  // The advanced edition's left column is much taller than the preview column,
+  // so the component list moves under the preview instead of stretching the
+  // composer further down.
+  function placeComponentPanel() {
+    const target = $('stageExtra');
+    if (!target || !state.config.advancedEnabled || target.dataset.placed) return;
+    target.append($('componentLabel'), $('components'));
+    target.hidden = false;
+    target.dataset.placed = '1';
+  }
+
+  async function refreshConfig() {
+    try {
+      state.config = await api('/api/config');
+      $('modelPath').textContent = state.config.modelDir || '模型未加载';
+      $('modelPath').title = state.config.modelPackDir || '';
+      renderPacks();
+      renderModes();
+      placeComponentPanel();
+    } catch (error) {
+      console.warn('config refresh failed', error);
+    }
   }
 
   async function loadStatus() {
@@ -125,9 +282,9 @@
       $('modelPath').textContent = status.modelDir || '模型未加载';
       $('modelPath').title = status.modelDir || '';
 
-      if (!status.modelLoaded && status.modelError) {
-        showAlert('模型加载失败：' + status.modelError);
-      }
+      // The banner is driven by /api/config (file probes), which is the only
+      // source that knows which component is missing.
+      updateModelBanner();
     } catch (error) {
       $('gpuName').textContent = '设备信息不可用';
       $('gpuName').className = 'chip chip-warn';
@@ -190,6 +347,148 @@
       if (node.dataset.id !== state.presetId) continue;
       node.querySelector('small').textContent = changed ? '画布已自定义' : node.dataset.desc;
     }
+  }
+
+  /* ---------------------------------------------------------------- demos */
+
+  /* Built-in examples, one set per generation mode. Each one is a working
+   * prompt plus the spec it was tuned for, so the fastest way to learn the
+   * model is to press a card and then edit one clause.
+   *
+   * They deliberately cover the three things that are hard to discover from
+   * the model alone: how much concrete detail a prompt needs, how to place an
+   * action in time (H3 follows explicit second ranges), and how to name a
+   * camera move instead of hoping for one. The first/last-frame and reference
+   * demos ship their source image so the whole path works in one click. */
+  const DEMOS = [
+    {
+      id: 't2v-real', mode: 't2v', title: '写实 + 推镜', note: '黄金时刻 · dolly-in',
+      preset: 'balanced',
+      prompt: '一只赤狐在刚落的雪原上缓步前行，黄金时刻的低角度侧逆光把毛尖照成金色，鼻息呼出的白气清晰可见。'
+        + '镜头从全景缓慢推近（dolly-in）到中景，35mm 浅景深，背景雪面虚化成奶油状散景，'
+        + '轻微手持呼吸感，胶片颗粒，24fps 电影质感。'
+    },
+    {
+      id: 't2v-timeline', mode: 't2v', title: '时间轴精确控制', note: '按秒分段描述动作',
+      preset: 'balanced',
+      prompt: '0-2 秒：雨夜的东京小巷，霓虹灯牌在积水里倒映成一片红色，镜头静止，只有雨滴打在铁皮雨棚上。'
+        + '2-4 秒：一名穿米色风衣的女子从画面左侧入画，走进巷子深处，镜头开始缓慢跟随（tracking shot），'
+        + '焦点从前景水洼拉到她的背影。'
+        + '4-6 秒：她停下脚步回头看向镜头，霓虹光在脸上扫过，镜头轻微推近。'
+        + '整体冷调，青蓝阴影配品红高光，35mm 变形宽银幕，轻微光晕。'
+    },
+    {
+      id: 't2v-orbit', mode: 't2v', title: '高级运镜：环绕', note: 'orbit + 广角',
+      preset: 'balanced',
+      prompt: '一座被苔藓覆盖的石砌灯塔立在黑色玄武岩海崖上，正午硬光，海雾在脚下翻涌。'
+        + '镜头以灯塔为中心做 180 度环绕（orbit shot），从背光剪影转到迎光的暖色石面，同时缓慢下降。'
+        + '24mm 广角，边缘轻微桶形畸变，高快门凝固浪花，色彩浓郁。'
+    },
+    {
+      id: 't2v-mood', mode: 't2v', title: '氛围与声音', note: '横移 · 环境音',
+      preset: 'balanced',
+      prompt: '深夜的旧书店，只有一盏黄铜台灯亮着，尘埃在光柱里缓慢漂浮。'
+        + '镜头极缓慢地横向平移（slider），扫过一排排书脊。'
+        + '暖色钨丝灯，深绿与琥珀色调，浅景深，细微颗粒。'
+        + '环境音：远处雨声、翻书声、老旧木地板的轻响。'
+    },
+    {
+      id: 'fl2v-continue', mode: 'fl2v', title: '首帧续写 + 推镜', note: '内置首帧，一键可跑',
+      preset: 'balanced',
+      sample: { url: 'demo/fox-snow.jpg', slot: 'first' },
+      prompt: '以这一帧为起点：赤狐保持原有的姿态与毛色，向前迈出两步，耳朵轻微转动，鼻息带出白气。'
+        + '镜头继续缓慢推近并轻微右移，黄金时刻的侧逆光保持不变，脚步扬起细雪。'
+        + '严格保持原片的色调、胶片颗粒与浅景深。'
+    },
+    {
+      id: 'fl2v-bridge', mode: 'fl2v', title: '首尾帧过渡', note: '内置两帧，一键可跑',
+      preset: 'balanced',
+      samples: [
+        { url: 'demo/fox-snow.jpg', slot: 'first' },
+        { url: 'demo/snow-forest.jpg', slot: 'last' }
+      ],
+      prompt: '从首帧的近景赤狐拉成尾帧的雪林远景：镜头持续后拉（dolly-out）并轻微上升，'
+        + '赤狐转身小跑着没入画面深处的雪林，只剩一串脚印。'
+        + '光线从首帧的暖金侧逆光自然过渡到尾帧的冷蓝暮色，雪面反射由暖转冷。'
+        + '两帧之间的主体毛色、雪地纹理与镜头焦段保持一致，运动连续，不要跳切。'
+    },
+    {
+      id: 'ref2v-subject', mode: 'ref2v', title: '主体一致性', note: '内置参考图，一键可跑',
+      preset: 'balanced',
+      sample: { url: 'demo/fox-snow.jpg', slot: 'ref' },
+      prompt: '参考图中的赤狐作为主体：把它放进一间铺着波斯地毯的旧书房，午后斜光从百叶窗落在它身上。'
+        + '它抬头看向镜头，耳朵前倾。镜头低角度缓慢推近。'
+        + '保持参考图里狐狸的毛色、体态与面部特征完全一致，只改变环境与光线。'
+    },
+    {
+      id: 'ref2v-compose', mode: 'ref2v', title: '多图组合', note: '内置两张，一键可跑',
+      preset: 'balanced',
+      samples: [
+        { url: 'demo/fox-snow.jpg', slot: 'ref' },
+        { url: 'demo/snow-forest.jpg', slot: 'ref' }
+      ],
+      prompt: '参考图 1 提供主体（赤狐的毛色、体态与面部特征），参考图 2 提供场景（积雪针叶林与暮色天空）。'
+        + '把这只赤狐放进参考图 2 的林线前，它站在齐踝的深雪里回头望向镜头，呼出的白气在冷空气里散开。'
+        + '镜头从低角度缓慢推近并轻微右移，前景雪粒被风吹起。'
+        + '主体特征严格取自图 1，环境结构与光线方向严格取自图 2，整体统一为冷蓝阴影配暖橘高光。'
+    }
+  ];
+
+  function renderDemos() {
+    const container = $('demos');
+    if (!container) return;
+    const list = DEMOS.filter((demo) => demo.mode === state.mode);
+    $('demoField').hidden = list.length === 0;
+    container.innerHTML = '';
+    for (const demo of list) {
+      const card = document.createElement('button');
+      card.className = 'demo';
+      card.innerHTML = '<b></b><small></small>';
+      card.querySelector('b').textContent = demo.title;
+      card.querySelector('small').textContent = demo.note;
+      if (demo.id === state.demoId) card.classList.add('active');
+      card.addEventListener('click', () => applyDemo(demo));
+      container.appendChild(card);
+    }
+  }
+
+  async function applyDemo(demo) {
+    state.demoId = demo.id;
+    $('prompt').value = demo.prompt;
+    $('prompt').scrollTop = 0;
+    if (demo.preset) selectPreset(demo.preset, false);
+    renderDemos();
+    const samples = demo.samples || (demo.sample ? [demo.sample] : []);
+    if (samples.length === 0) {
+      $('prompt').focus();
+      return;
+    }
+    try {
+      toast(samples.length > 1 ? `正在载入 ${samples.length} 张示例素材…` : '正在载入示例素材…');
+      const uploaded = [];
+      for (const sample of samples) {
+        const response = await fetch(sample.url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        const name = sample.url.split('/').pop();
+        const file = new File([blob], name, { type: blob.type || 'image/jpeg' });
+        uploaded.push({ slot: sample.slot, ...(await uploadFile(file)) });
+      }
+      const references = uploaded.filter((row) => row.slot === 'ref');
+      if (references.length) {
+        state.refImages = references.map((row) => ({ url: row.url, name: row.name }));
+        renderRefImages();
+      }
+      for (const row of uploaded) {
+        if (row.slot === 'ref') continue;
+        state.anchors[row.slot] = row.url;
+        renderAnchor(row.slot, row.url);
+      }
+      toast('示例素材已就位，可直接生成', 'ok');
+    } catch (error) {
+      toast('示例素材载入失败：' + error.message, 'err');
+    }
+    $('prompt').focus();
   }
 
   /* ------------------------------------------------------------ selectors */
@@ -301,6 +600,13 @@
       if (target.type === 'anchor') {
         state.anchors[target.slot] = result.url;
         renderAnchor(target.slot, result.url);
+      } else if (target.type === 'image') {
+        if (state.refImages.length >= maxRefImages()) {
+          toast(`参考图最多 ${maxRefImages()} 张`, 'err');
+        } else {
+          state.refImages.push({ url: result.url, name: result.name });
+          renderRefImages();
+        }
       } else if (target.type === 'ref') {
         const row = state.refs[target.index];
         if (row) { row.path = result.url; row.name = result.name; renderRefs(); }
@@ -364,6 +670,77 @@
 
   /* ----------------------------------------------------------- references */
 
+  /* Ordered reference images. The engine treats references as a sequence, so
+   * the badge is the index the prompt has to refer to (image 1, image 2 ...). */
+  function renderRefImages() {
+    const grid = $('refGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    state.refImages.forEach((row, index) => {
+      const card = document.createElement('div');
+      card.className = 'refcard';
+
+      const img = document.createElement('img');
+      img.src = row.url;
+      img.alt = row.name || `参考图 ${index + 1}`;
+      img.title = row.name || '';
+
+      const order = document.createElement('span');
+      order.className = 'order';
+      order.textContent = String(index + 1);
+
+      const controls = document.createElement('div');
+      controls.className = 'refcontrols';
+      const left = document.createElement('button');
+      left.className = 'mini';
+      left.textContent = '‹';
+      left.title = '前移';
+      left.disabled = index === 0;
+      left.addEventListener('click', () => moveRef(index, -1));
+      const right = document.createElement('button');
+      right.className = 'mini';
+      right.textContent = '›';
+      right.title = '后移';
+      right.disabled = index === state.refImages.length - 1;
+      right.addEventListener('click', () => moveRef(index, 1));
+      controls.append(left, right);
+
+      const del = document.createElement('button');
+      del.className = 'del';
+      del.textContent = '×';
+      del.title = '移除';
+      del.addEventListener('click', () => {
+        state.refImages.splice(index, 1);
+        renderRefImages();
+      });
+
+      card.append(img, order, controls, del);
+      grid.appendChild(card);
+    });
+
+    if (state.refImages.length < maxRefImages()) {
+      const add = document.createElement('button');
+      add.className = 'refadd';
+      add.type = 'button';
+      add.innerHTML = '<b>+</b><span>添加参考图</span>';
+      add.addEventListener('click', () => pickFile({ type: 'image' }));
+      grid.appendChild(add);
+    }
+
+    $('refImageHint').textContent = state.refImages.length
+      ? `已选 ${state.refImages.length} / ${maxRefImages()} 张，顺序即优先级`
+      : `按顺序生效，最多 ${maxRefImages()} 张`;
+  }
+
+  function moveRef(index, delta) {
+    const target = index + delta;
+    if (target < 0 || target >= state.refImages.length) return;
+    const [row] = state.refImages.splice(index, 1);
+    state.refImages.splice(target, 0, row);
+    renderRefImages();
+  }
+
   function renderRefs() {
     const container = $('refList');
     container.innerHTML = '';
@@ -372,13 +749,13 @@
       node.className = 'refrow';
 
       const kind = document.createElement('select');
-      for (const [value, label] of [['image', '图片'], ['video', '视频'], ['audio', '音频'], ['video_audio', '视频+音轨']]) {
+      for (const [value, label] of [['video', '视频'], ['audio', '音频'], ['video_audio', '视频+音轨']]) {
         const option = document.createElement('option');
         option.value = value;
         option.textContent = label;
         kind.appendChild(option);
       }
-      kind.value = row.kind;
+      kind.value = row.kind === 'image' ? 'video' : row.kind;
       kind.addEventListener('change', () => { row.kind = kind.value; });
 
       const path = document.createElement('input');
@@ -415,13 +792,28 @@
     const request = {
       prompt: $('prompt').value.trim(),
       preset: state.presetId,
+      mode: state.mode,
       width, height, frames,
       seed,
       livePreview: $('livePreview').checked,
-      previewEvery: 4,
-      firstFrame: state.anchors.first,
-      lastFrame: state.anchors.last
+      previewEvery: 4
     };
+
+    if (state.mode === 'fl2v') {
+      request.firstFrame = state.anchors.first;
+      request.lastFrame = state.anchors.last;
+    }
+
+    if (state.mode === 'ref2v') {
+      // Images first (they are the ordered part), then any advanced video /
+      // audio the user added.
+      const references = state.refImages.map((row) => ({ kind: 'image', path: row.url }));
+      if (advanced) {
+        for (const row of state.refs.filter((r) => r.path))
+          references.push({ kind: row.kind, path: row.path });
+      }
+      if (references.length > 0) request.references = references;
+    }
 
     if (advanced) {
       Object.assign(request, {
@@ -445,11 +837,6 @@
       if (num('advHeight')) request.height = num('advHeight');
       if (num('advFrames')) request.frames = num('advFrames');
       if ($('packSelect').value) request.modelDir = $('packSelect').value;
-
-      const references = state.refs
-        .filter((row) => row.path)
-        .map((row) => ({ kind: row.kind, path: row.path }));
-      if (references.length > 0) request.references = references;
     }
 
     return request;
@@ -463,6 +850,18 @@
     if (!request.prompt) {
       showAlert('请先填写提示词。');
       $('prompt').focus();
+      return;
+    }
+    if (state.mode === 'fl2v' && !request.firstFrame && !request.lastFrame) {
+      showAlert('首尾帧模式至少需要一张首帧或尾帧。');
+      return;
+    }
+    if (state.mode === 'ref2v' && (!request.references || request.references.length === 0)) {
+      showAlert('多图参考模式至少需要一张参考图。');
+      return;
+    }
+    if (state.mode === 'ref2v' && !state.config.ref2vaAvailable) {
+      showAlert('当前模型包不含 Ref2VA 权重，无法做多图参考。请按“模型指引”补上 Ref2VA。');
       return;
     }
 
@@ -508,6 +907,47 @@
 
   /* --------------------------------------------------------------- render */
 
+  /* The engine reports stages on their own scales; the server folds them into
+   * one overall fraction. These chips show where that fraction sits. */
+  const STAGE_PLAN = [
+    { label: '文本编码', match: ['tokenizer', 'text encoder', 'Qwen vision'] },
+    { label: '加载 DiT', match: ['AdaLN', 'load transformer core'] },
+    { label: '去噪', match: ['denoise', 'denoise enqueue'] },
+    { label: '视频解码', match: ['video VAE load', 'preview VAE load'] },
+    { label: '音频', match: ['audio VAE'] },
+    { label: '封装', match: ['FFmpeg', 'save'] }
+  ];
+
+  function stageIndexOf(phase) {
+    if (!phase) return -1;
+    return STAGE_PLAN.findIndex((stage) => stage.match.includes(phase));
+  }
+
+  function renderStageStrip(phase, status) {
+    const strip = $('stageStrip');
+    if (!strip) return;
+    if (!phase) { strip.hidden = true; strip.textContent = ''; return; }
+    const active = stageIndexOf(phase);
+    strip.hidden = false;
+    strip.textContent = '';
+    STAGE_PLAN.forEach((stage, index) => {
+      const chip = document.createElement('span');
+      const state = status === 'completed' || index < active ? 'done'
+        : index === active ? 'active' : 'todo';
+      chip.className = 'stagechip ' + state;
+      chip.textContent = stage.label;
+      strip.appendChild(chip);
+    });
+  }
+
+  function formatDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '?';
+    if (seconds < 60) return seconds.toFixed(0) + 's';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + 'm' + String(Math.round(seconds % 60)).padStart(2, '0') + 's';
+    return Math.floor(minutes / 60) + 'h' + String(minutes % 60).padStart(2, '0') + 'm';
+  }
+
   function resetStage() {
     $('placeholder').hidden = true;
     $('resultVideo').hidden = true;
@@ -519,6 +959,7 @@
     $('phasePanel').hidden = true;
     $('rawPanel').hidden = true;
     $('barFill').style.width = '0%';
+    renderStageStrip(null, 'idle');
   }
 
   function renderJob(job) {
@@ -538,18 +979,24 @@
         $('progressText').textContent = progress
           ? `已运行 ${(progress.elapsedMs / 1000).toFixed(1)}s`
           : '';
-      } else if (progress && progress.fraction != null) {
-        $('phaseText').textContent = progress.phase || '生成中';
+      } else if (progress) {
+        const overall = typeof progress.overall === 'number' ? progress.overall : 0;
+        const stage = progress.stage || progress.phase || '生成中';
+        const detail = progress.total > 0
+          ? `${progress.completed}/${progress.total}` : '';
+        $('phaseText').textContent = detail ? `${stage} · ${detail}` : stage;
         $('barFill').classList.remove('indeterminate');
-        $('barFill').style.width = (progress.fraction * 100).toFixed(1) + '%';
-        $('progressText').textContent =
-          `${progress.completed} / ${progress.total} · ${(progress.elapsedMs / 1000).toFixed(1)}s`;
+        $('barFill').style.width = (overall * 100).toFixed(1) + '%';
+        const elapsed = (progress.elapsedMs || 0) / 1000;
+        const parts = [`${(overall * 100).toFixed(0)}%`,
+                       `已用 ${formatDuration(elapsed)}`];
+        if (progress.etaMs) parts.push(`剩余约 ${formatDuration(progress.etaMs / 1000)}`);
+        $('progressText').textContent = parts.join(' · ');
+        renderStageStrip(progress.phase, job.status);
       } else {
-        $('phaseText').textContent = (progress && progress.phase) || '生成中';
+        $('phaseText').textContent = '生成中';
         $('barFill').classList.add('indeterminate');
-        $('progressText').textContent = progress
-          ? `${(progress.elapsedMs / 1000).toFixed(1)}s`
-          : '';
+        $('progressText').textContent = '';
       }
       if (job.previewUrl && job.livePreview) {
         const img = $('previewImg');
@@ -563,6 +1010,7 @@
       $('barFill').classList.remove('indeterminate');
       $('barFill').style.width = '100%';
       $('phaseText').textContent = '已完成';
+      renderStageStrip('save', 'completed');
       const result = job.result || {};
       $('progressText').textContent = result.elapsedMs
         ? `${(result.elapsedMs / 1000).toFixed(1)}s · ${result.framesPerSecond ? result.framesPerSecond.toFixed(2) : '?'} fps`
@@ -732,6 +1180,7 @@
   function bind() {
     bindDropzones();
     renderRefs();
+    renderRefImages();
 
     $('prompt').addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
@@ -741,6 +1190,8 @@
     });
 
     $('btnGenerate').addEventListener('click', generate);
+
+    $('btnRecheck').addEventListener('click', recheckModel);
 
     $('btnCancel').addEventListener('click', async () => {
       if (!state.jobId) return;
@@ -754,10 +1205,6 @@
 
     $('btnDice').addEventListener('click', () => {
       $('seed').value = Math.floor(Math.random() * 2147483647);
-    });
-
-    $('mode').addEventListener('change', () => {
-      $('anchorField').hidden = $('mode').value !== 'fl2v';
     });
 
     $('btnPreload').addEventListener('click', async () => {
@@ -795,15 +1242,19 @@
       }
     });
 
-    $('btnRefresh').addEventListener('click', () => {
+    $('btnRefresh').addEventListener('click', async () => {
+      await refreshConfig();
+      renderComponents();
+      updateModelBanner();
       loadStatus();
       loadHistory();
       toast('已刷新');
     });
 
     $('btnAddRef').addEventListener('click', () => {
-      if (state.refs.length >= 16) { toast('最多 16 个参考素材', 'err'); return; }
-      state.refs.push({ kind: 'image', path: null, name: null });
+      const limit = (state.config.maxReferences || 12) - state.refImages.length;
+      if (state.refs.length >= limit) { toast(`参考素材最多 ${limit} 个`, 'err'); return; }
+      state.refs.push({ kind: 'video', path: null, name: null });
       renderRefs();
     });
 

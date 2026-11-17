@@ -52,6 +52,26 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    /* HyperFlow Flash stores some blocks as BF16 `down`/`up` factor pairs
+     * instead of a dense projection, and the fused qkv as three separate
+     * q/k/v pairs with their own ranks.  A pair replaces the dense matrix of
+     * that module outright (the reference implementation swaps the module, it
+     * does not add the two), so a block is either dense or factorized per
+     * module.  `qkv_parts` is 3 when the attention input projection is
+     * factorized, 0 when `qkv` holds the dense fused matrix. */
+    h3_gpu_tensor *qkv_down[3];
+    h3_gpu_tensor *qkv_up[3];
+    uint32_t qkv_rank[3];
+    int qkv_parts;
+    h3_gpu_tensor *out_down;
+    h3_gpu_tensor *out_up;
+    uint32_t out_rank;
+    h3_gpu_tensor *fc1_down;
+    h3_gpu_tensor *fc1_up;
+    uint32_t fc1_rank;
+    h3_gpu_tensor *fc2_down;
+    h3_gpu_tensor *fc2_up;
+    uint32_t fc2_rank;
 } h3_dit_block;
 
 enum {
@@ -120,6 +140,14 @@ struct h3_dit {
     float token_reduction_scale;
     float spatial_rope_scale;
     int bf16_final;
+    /* Shared expansion targets for factorized (HyperFlow) projections.  One
+     * scratch holds the widest matrix a block needs at a time: qkv (3*INNER)
+     * or fc1 (2*FFN) in `lr_scratch_wide`, out (INNER) or fc2 (FFN) in
+     * `lr_scratch_narrow`.  Two buffers because the fused MLP kernel reads fc1
+     * and fc2 in the same call. */
+    h3_gpu_tensor *lr_scratch_wide;
+    h3_gpu_tensor *lr_scratch_narrow;
+    int has_lowrank;
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
@@ -133,7 +161,10 @@ struct h3_dit {
     unsigned fbc_max_streak;
     float fbc_rel;
     unsigned active_block_count;
-    uint8_t block_active[H3_DIT_BLOCKS];
+    /* Depth of the loaded transformer: 50 for the unpruned release, 47 or 49
+     * for a HyperFlow Flash checkpoint, which drops blocks and renumbers. */
+    unsigned block_count;
+    uint8_t block_active[H3_DIT_MAX_BLOCKS];
     h3_layout layout;
     h3_sigma_schedule sigmas;
     int latent_t;
@@ -166,9 +197,9 @@ struct h3_dit {
     h3_gpu_tensor *video_patch_b;
     h3_gpu_tensor *audio_patch_w;
     h3_gpu_tensor *audio_patch_b;
-    h3_dit_block blocks[H3_DIT_BLOCKS];
+    h3_dit_block blocks[H3_DIT_MAX_BLOCKS];
     h3_dit_block stream_slots[2];
-    h3_dit_stream_layer stream_layers[H3_DIT_BLOCKS];
+    h3_dit_stream_layer stream_layers[H3_DIT_MAX_BLOCKS];
     unsigned stream_ready_layer;
     unsigned stream_ready_slot;
     uint64_t stream_bytes;
@@ -247,11 +278,11 @@ static unsigned command_block_interval(const h3_dit *dit) {
         char *end = NULL;
         long parsed = strtol(value, &end, 10);
         return end != value && !*end && parsed >= 0 &&
-               parsed <= H3_DIT_BLOCKS ? (unsigned)parsed : 0;
+               parsed <= (long)dit->block_count ? (unsigned)parsed : 0;
     }
     if (h3_gpu_is_m5(dit->gpu))
         return dit->active_block_count * 3 / 5;
-    return dit->active_block_count == H3_DIT_BLOCKS ? 30u : 0u;
+    return dit->active_block_count == dit->block_count ? 30u : 0u;
 }
 
 static int gpu_op(h3_dit *dit, int ok, char *error, size_t error_size,
@@ -435,9 +466,10 @@ static int configure_token_reduction(h3_dit *dit, int requested,
         char *tail = NULL;
         unsigned long parsed_end = strtoul(middle + 1, &tail, 10);
         if (tail == middle + 1 || *tail || parsed_begin >= parsed_end ||
-            parsed_end > H3_DIT_BLOCKS) {
+            parsed_end > dit->block_count) {
             fail(error, error_size,
-                 "token-reduction block range must satisfy 0 <= BEGIN < END <= 50");
+                 "token-reduction block range must satisfy 0 <= BEGIN < END "
+                 "<= %u", dit->block_count);
             return 0;
         }
         begin = (unsigned)parsed_begin;
@@ -464,10 +496,10 @@ static int configure_token_reduction(h3_dit *dit, int requested,
             unsigned long parsed_end = strtoul(middle + 1, &tail, 10);
             if (tail == middle + 1 || *tail || !parsed_steps ||
                 parsed_steps > 1000 || parsed_end <= end ||
-                parsed_end > H3_DIT_BLOCKS) {
+                parsed_end > dit->block_count) {
                 fail(error, error_size,
                      "early token reduction requires STEPS > 0 and "
-                     "base END < END <= 50");
+                     "base END < END <= %u", dit->block_count);
                 return 0;
             }
             early_steps = (unsigned)parsed_steps;
@@ -551,6 +583,42 @@ static int is_tower_qkv(const char *name) {
            strncmp(name, "token_refiner.", 14) == 0;
 }
 
+/* HyperFlow Flash factorized linear: `<module>.down.weight` [rank][in] and
+ * `<module>.up.weight` [out][rank] replace the dense matrix of that module.
+ * Returns 1 when the pair was loaded, 0 when the module is dense (nothing
+ * loaded), -1 on error. */
+static int load_lowrank(h3_dit *dit, const char *prefix, const char *module,
+                        h3_gpu_tensor **down, h3_gpu_tensor **up,
+                        uint32_t *rank, char *error, size_t error_size) {
+    char name[192];
+    snprintf(name, sizeof(name), "%s%s.down.weight", prefix, module);
+    const h3_st_tensor *down_tensor = h3_weight_find(dit->weights, name, NULL);
+    if (!down_tensor) return 0;
+    snprintf(name, sizeof(name), "%s%s.up.weight", prefix, module);
+    const h3_st_tensor *up_tensor = h3_weight_find(dit->weights, name, NULL);
+    if (!up_tensor) {
+        fail(error, error_size, "%s%s has a down factor but no up factor",
+             prefix, module);
+        return -1;
+    }
+    if (down_tensor->ndim != 2 || up_tensor->ndim != 2) {
+        fail(error, error_size, "%s%s factors are not 2-D", prefix, module);
+        return -1;
+    }
+    uint64_t down_shape[] = {down_tensor->shape[0], down_tensor->shape[1]};
+    uint64_t up_shape[] = {up_tensor->shape[0], up_tensor->shape[1]};
+    snprintf(name, sizeof(name), "%s%s.down.weight", prefix, module);
+    *down = h3_weight_load_bf16(dit->weights, dit->gpu, name, 2, down_shape,
+                                error, error_size);
+    snprintf(name, sizeof(name), "%s%s.up.weight", prefix, module);
+    *up = *down ? h3_weight_load_bf16(dit->weights, dit->gpu, name, 2, up_shape,
+                                      error, error_size)
+                : NULL;
+    if (!*down || !*up) return -1;
+    *rank = (uint32_t)down_shape[0];
+    return 1;
+}
+
 /* Load one DiT projection from either flavour of checkpoint: BF16 (quantized on
  * the fly afterwards) or the ConvRot INT8 build, which stores I8 weights plus one
  * F32 scale per output row and has no BF16 copy at all. */
@@ -570,13 +638,6 @@ static int load_projection(h3_dit *dit, const char *name, uint64_t rows,
                                                 rows, columns, scales, error,
                                                 error_size);
         return *int8 != NULL;
-    }
-    /* Only the block tower is all-or-nothing INT8; the token refiner stays BF16
-     * even in an INT8 ConvRot checkpoint. */
-    if (dit->int8_checkpoint && strncmp(name, "blocks.", 7) == 0) {
-        fail(error, error_size,
-             "checkpoint mixes BF16 and INT8 DiT weights (%s is not INT8)", name);
-        return 0;
     }
     if (qkv) {
         *bf16 = h3_weight_load_qkv_perhead_bf16(dit->weights, dit->gpu, name,
@@ -607,12 +668,52 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
 } while (0)
     LOAD1(norm1, "norm1.weight", HIDDEN);
     LOAD1(norm2, "norm2.weight", HIDDEN);
-    PROJ(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
+    /* HyperFlow Flash factorizes a projection by swapping the module for a
+     * down/up pair; when the pair is present the dense matrix (if any is even
+     * stored) is ignored, exactly like the reference implementation. */
+    static const char *const qkv_modules[3] = {"attn.q_proj", "attn.k_proj",
+                                               "attn.v_proj"};
+    int qkv_factorized = 1;
+    for (int part = 0; part < 3 && qkv_factorized; part++) {
+        int loaded = load_lowrank(dit, prefix, qkv_modules[part],
+                                  &block->qkv_down[part], &block->qkv_up[part],
+                                  &block->qkv_rank[part], error, error_size);
+        if (loaded < 0) return 0;
+        if (!loaded) qkv_factorized = 0;
+    }
+    if (qkv_factorized) {
+        block->qkv_parts = 3;
+        dit->has_lowrank = 1;
+    } else {
+        PROJ(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
+    }
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
-    PROJ(out, "attn.out_proj.weight", HIDDEN, INNER);
-    PROJ(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
-    PROJ(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    int loaded = load_lowrank(dit, prefix, "attn.out_proj", &block->out_down,
+                              &block->out_up, &block->out_rank, error,
+                              error_size);
+    if (loaded < 0) return 0;
+    if (loaded) {
+        dit->has_lowrank = 1;
+    } else {
+        PROJ(out, "attn.out_proj.weight", HIDDEN, INNER);
+    }
+    loaded = load_lowrank(dit, prefix, "mlp.fc1", &block->fc1_down,
+                          &block->fc1_up, &block->fc1_rank, error, error_size);
+    if (loaded < 0) return 0;
+    if (loaded) {
+        dit->has_lowrank = 1;
+    } else {
+        PROJ(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+    }
+    loaded = load_lowrank(dit, prefix, "mlp.fc2", &block->fc2_down,
+                          &block->fc2_up, &block->fc2_rank, error, error_size);
+    if (loaded < 0) return 0;
+    if (loaded) {
+        dit->has_lowrank = 1;
+    } else {
+        PROJ(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    }
 #undef LOAD1
 #undef PROJ
     return 1;
@@ -652,6 +753,17 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    for (int part = 0; part < 3; part++) {
+        free_tensor(&block->qkv_down[part]);
+        free_tensor(&block->qkv_up[part]);
+    }
+    block->qkv_parts = 0;
+    free_tensor(&block->out_down);
+    free_tensor(&block->out_up);
+    free_tensor(&block->fc1_down);
+    free_tensor(&block->fc1_up);
+    free_tensor(&block->fc2_down);
+    free_tensor(&block->fc2_up);
 }
 
 static double stream_now(void) {
@@ -782,6 +894,30 @@ static void *read_stream_layer_thread(void *opaque) {
     return NULL;
 }
 
+/* Expansion targets for factorized projections.  Allocated once and reused by
+ * every block: the widest matrix a block needs at a time is fc1 (2*FFN) or qkv
+ * (3*INNER) across HIDDEN, and the second widest is fc2 (FFN) or out (INNER).
+ * Two buffers because the fused MLP kernel reads fc1 and fc2 in one call.
+ * 308 MiB + 154 MiB instead of the 6.5 GiB a resident dense copy would cost. */
+static int ensure_lowrank_scratch(h3_dit *dit, char *error,
+                                  size_t error_size) {
+    if (!dit->has_lowrank) return 1;
+    if (dit->lr_scratch_wide && dit->lr_scratch_narrow) return 1;
+    size_t wide = (size_t)FFN * 2 * HIDDEN;
+    if ((size_t)INNER * 3 * HIDDEN > wide) wide = (size_t)INNER * 3 * HIDDEN;
+    size_t narrow = (size_t)HIDDEN * FFN;
+    if ((size_t)HIDDEN * INNER > narrow) narrow = (size_t)HIDDEN * INNER;
+    dit->lr_scratch_wide = h3_gpu_tensor_new_bf16(dit->gpu, wide);
+    dit->lr_scratch_narrow = h3_gpu_tensor_new_bf16(dit->gpu, narrow);
+    if (!dit->lr_scratch_wide || !dit->lr_scratch_narrow) {
+        fail(error, error_size,
+             "cannot allocate the low-rank expansion scratch: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    return 1;
+}
+
 static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
     block->fc1_int8 = h3_gpu_tensor_new_i8(
@@ -807,8 +943,7 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
-static int release_block_bf16_after_int8(h3_dit *dit, h3_dit_block *block) {
-    if (!h3_gpu_submit(dit->gpu)) {
+static int release_block_bf16_after_int8(h3_dit *dit, h3_dit_block *block) {    if (!h3_gpu_submit(dit->gpu)) {
         return 0;
     }
     if (dit->int8_mlp && !dit->keep_bf16_mlp) {
@@ -1284,44 +1419,45 @@ static int prepare_token_reduction_maps(h3_dit *dit, char *error,
 }
 
 static void configure_active_blocks(h3_dit *dit, unsigned active) {
-    memset(dit->block_active, 1, sizeof(dit->block_active));
+    memset(dit->block_active, 1, dit->block_count);
+    if (active > dit->block_count) active = dit->block_count;
     dit->active_block_count = active;
-    unsigned skipped = H3_DIT_BLOCKS - active;
+    unsigned skipped = dit->block_count - active;
     for (unsigned index = 0; index < skipped; index++) {
-        unsigned block = ((2 * index + 1) * H3_DIT_BLOCKS) / (2 * skipped);
+        unsigned block = ((2 * index + 1) * dit->block_count) / (2 * skipped);
         if (block == 0) block = 1;
-        if (block >= H3_DIT_BLOCKS - 1) block = H3_DIT_BLOCKS - 2;
+        if (block >= dit->block_count - 1) block = dit->block_count - 2;
         dit->block_active[block] = 0;
     }
 }
 
 static unsigned first_active_block(const h3_dit *dit) {
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+    for (unsigned block = 0; block < dit->block_count; block++)
         if (dit->block_active[block]) return block;
-    return H3_DIT_BLOCKS;
+    return dit->block_count;
 }
 
 static unsigned next_active_block(const h3_dit *dit, unsigned current) {
-    for (unsigned block = current + 1; block < H3_DIT_BLOCKS; block++)
+    for (unsigned block = current + 1; block < dit->block_count; block++)
         if (dit->block_active[block]) return block;
-    return H3_DIT_BLOCKS;
+    return dit->block_count;
 }
 
 static void configure_gate_ranked_blocks(h3_dit *dit) {
     const char *policy = getenv("H3_DIT_LAYER_POLICY");
     if ((policy && !strcmp(policy, "uniform")) ||
-        dit->active_block_count == H3_DIT_BLOCKS) return;
+        dit->active_block_count == dit->block_count) return;
     typedef struct { unsigned block; double score; } block_score;
     /* The first two and final blocks establish/close the residual stream.
      * Block 1 has a small gate but proved structurally essential in decoded
      * A/B renders, so magnitude ranking must not treat it as disposable. */
-    block_score scores[H3_DIT_BLOCKS - 3];
-    for (unsigned block = 2; block + 1 < H3_DIT_BLOCKS; block++) {
+    block_score scores[H3_DIT_MAX_BLOCKS - 3];
+    for (unsigned block = 2; block + 1 < dit->block_count; block++) {
         double score = h3_dit_schedule_gate_score(dit->schedule, block);
         if (score < 0.0) return;
         scores[block - 2] = (block_score){block, score};
     }
-    unsigned count = H3_DIT_BLOCKS - 3;
+    unsigned count = dit->block_count - 3;
     for (unsigned left = 0; left < count; left++) {
         unsigned least = left;
         for (unsigned right = left + 1; right < count; right++)
@@ -1330,8 +1466,8 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
         scores[left] = scores[least];
         scores[least] = temporary;
     }
-    memset(dit->block_active, 1, sizeof(dit->block_active));
-    unsigned skipped = H3_DIT_BLOCKS - dit->active_block_count;
+    memset(dit->block_active, 1, dit->block_count);
+    unsigned skipped = dit->block_count - dit->active_block_count;
     for (unsigned index = 0; index < skipped; index++)
         dit->block_active[scores[index].block] = 0;
     if (getenv("H3_PROFILE")) {
@@ -1561,10 +1697,10 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
     uint64_t cache_key =
         (!dit->ssd_streaming && dit_int8_cacheable(dit)) ? dit_int8_cache_key(dit)
                                                          : 0;
-    for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
+    for (unsigned index = 0; index < dit->block_count; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
-                   H3_DIT_BLOCKS);
+                   (int)dit->block_count);
             continue;
         }
         char prefix[64];
@@ -1607,7 +1743,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                     dit_int8_cache_store(&dit->blocks[index], index, cache_key);
             }
         }
-        if (dit->lora &&
+        /* A PDD LoRA adapts the INT8 codes of a block; a factorized block has
+         * no INT8 codes to merge into, so it is left alone. */
+        if (dit->lora && dit->blocks[index].qkv_int8 &&
             !h3_lora_merge_block_int8(
                 dit->lora, dit->gpu, index,
                 dit->blocks[index].qkv_int8, dit->blocks[index].qkv_scales,
@@ -1617,14 +1755,15 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                 error, error_size))
             return 0;
         report(progress, opaque, "load transformer core", (int)index + 1,
-               H3_DIT_BLOCKS);
+               (int)dit->block_count);
     }
     if (dit->lora && !getenv("H3_QUIET")) {
         const unsigned merged = h3_lora_modules_merged(dit->lora);
         const unsigned indexed = h3_lora_modules_indexed(dit->lora);
         fprintf(stderr,
                 "h3: LoRA merged %u/%u modules into %u DiT blocks in %.2f s\n",
-                merged, indexed, H3_DIT_BLOCKS, h3_lora_seconds(dit->lora));
+                merged, indexed, dit->block_count,
+                h3_lora_seconds(dit->lora));
         /* Not fatal: the adaptor may legitimately carry modules this build has
          * no weights for (a projection the checkpoint does not have).  What
          * must not happen is that it goes unnoticed -- a half-merged adaptor
@@ -1641,7 +1780,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             !allocate_stream_slot(dit, &dit->stream_slots[1],
                                   error, error_size)) return 0;
         unsigned first = first_active_block(dit);
-        if (first == H3_DIT_BLOCKS) {
+        if (first == dit->block_count) {
             fail(error, error_size, "SSD stream has no active DiT block");
             return 0;
         }
@@ -2034,9 +2173,8 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
         (ssd_streaming != 0 && ssd_streaming != 1) ||
         !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f ||
-        active_blocks < H3_DIT_BLOCKS / 2 ||
-        active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
-        core_reuse_interval > 6) {
+        !active_blocks || active_blocks > H3_DIT_MAX_BLOCKS ||
+        core_reuse_interval < 1 || core_reuse_interval > 6) {
         fail(error, error_size, "invalid DiT load arguments");
         return NULL;
     }
@@ -2054,7 +2192,6 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
     dit->spatial_rope_scale = spatial_rope_scale;
-    configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
@@ -2074,6 +2211,20 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    dit->block_count = h3_weight_block_count(dit->weights);
+    if (!dit->block_count) {
+        fail(error, error_size,
+             "%s: no blocks.N.norm1.weight; not a MiniMax H3 transformer",
+             weight_directory);
+        goto failed;
+    }
+    if (!getenv("H3_QUIET"))
+        fprintf(stderr, "h3: transformer depth: %u blocks%s\n",
+                dit->block_count,
+                dit->block_count == H3_DIT_BLOCKS ? "" : " (pruned)");
+    /* active_blocks is a request relative to the unpruned 50-block depth, so
+     * a pruned checkpoint simply has nothing left to skip. */
+    configure_active_blocks(dit, active_blocks);
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -2198,7 +2349,7 @@ static h3_dit *load_dit(const char *weight_directory,
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
-                              H3_DIT_BLOCKS);
+                              dit->block_count);
     }
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
@@ -2417,6 +2568,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         dit->reduced_sequence : dit->sequence;
     const int convrot = dit->convrot;
     h3_gpu_tensor *convrot_scratch = dit->convrot_scratch;
+    /* A factorized block has no dense projection, so it has to run through the
+     * BF16 kernels even though the rest of the tower is INT8 ConvRot. */
+    const int block_int8_qkv =
+        dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV") && weight->qkv_int8;
+    const int block_int8_attention_out = dit->int8_attention_out &&
+        !getenv("H3_DISABLE_INT8_ATTENTION_OUT") && weight->out_int8;
+    const int block_int8_mlp =
+        dit->int8_mlp && weight->fc1_int8 && weight->fc2_int8;
+    const h3_gpu_tensor *qkv_weight = weight->qkv;
+    const h3_gpu_tensor *out_weight = weight->out;
+    const h3_gpu_tensor *fc1_weight = weight->fc1;
+    const h3_gpu_tensor *fc2_weight = weight->fc2;
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
@@ -2424,7 +2587,26 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (weight->qkv_parts) {
+        if (!ensure_lowrank_scratch(dit, error, error_size)) return 0;
+        /* The fused qkv the kernels consume is head-major: block h*3+kind
+         * holds head h of q, k and v, exactly like the INT8 ConvRot load
+         * reorders the checkpoint's contiguous [q][k][v] thirds.  Writing the
+         * factors as contiguous thirds instead would feed every head the
+         * wrong rows. */
+        for (int part = 0; part < 3; part++) {
+            const h3_gpu_tensor *up = weight->qkv_up[part];
+            for (uint32_t head = 0; head < HEADS; head++)
+                OP(h3_gpu_lowrank_fuse_rows(
+                       dit->gpu, dit->lr_scratch_wide,
+                       (uint32_t)(head * 3u + (uint32_t)part) * HEAD_DIM,
+                       HEAD_DIM, weight->qkv_down[part], up,
+                       head * HEAD_DIM, weight->qkv_rank[part], HIDDEN),
+                   "DiT low-rank QKV fusion");
+        }
+        qkv_weight = dit->lr_scratch_wide;
+    }
+    if (block_int8_qkv) {
         const h3_gpu_tensor *qkv_input = dit->mod_attention;
         if (convrot) {
             OP(h3_gpu_convrot_rotate_bf16(dit->gpu, convrot_scratch,
@@ -2446,12 +2628,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
-            dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
+            dit->mod_attention, qkv_weight, weight->q_norm, weight->k_norm,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
-    int int8_attention_output = dit->int8_attention_out &&
-        !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
+    int int8_attention_output = block_int8_attention_out;
     int head_major_attention_output = int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales && !convrot &&
@@ -2482,7 +2663,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    int fused_int8_mlp_input = dit->int8_mlp && !convrot &&
+    int fused_int8_mlp_input = block_int8_mlp && !convrot &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
         !getenv("H3_INT8_MLP_STAGE");
@@ -2503,10 +2684,22 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !convrot &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_INT8_QKV") &&
-        !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT");
-    int defer_mlp_output = dit->int8_mlp && !convrot &&
+        !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT") &&
+        /* The fused producer writes the quantized activation instead of the
+         * AdaLN output, so a factorized next block (which reads the BF16
+         * AdaLN output) cannot consume it. */
+        dit->blocks[next_index].qkv_int8;
+    int defer_mlp_output = block_int8_mlp && !convrot &&
         !getenv("H3_DISABLE_FUSED_BRANCH_RESCALE") &&
         !(fuse_int8_qkv_input && getenv("H3_SPLIT_ADALN_QUANT"));
+    if (weight->out_rank) {
+        if (!ensure_lowrank_scratch(dit, error, error_size)) return 0;
+        OP(h3_gpu_lowrank_fuse(dit->gpu, dit->lr_scratch_narrow, 0,
+                               weight->out_down, weight->out_up,
+                               weight->out_rank, INNER, HIDDEN),
+           "DiT low-rank attention-output fusion");
+        out_weight = dit->lr_scratch_narrow;
+    }
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -2533,7 +2726,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         }
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
-            dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
+            dit->attention_heads, out_weight, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
     if (fused_int8_mlp_input) {
@@ -2563,7 +2756,24 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (convrot && dit->int8_mlp) {
+    if (weight->fc1_rank || weight->fc2_rank) {
+        if (!ensure_lowrank_scratch(dit, error, error_size)) return 0;
+        if (weight->fc1_rank) {
+            OP(h3_gpu_lowrank_fuse(dit->gpu, dit->lr_scratch_wide, 0,
+                                   weight->fc1_down, weight->fc1_up,
+                                   weight->fc1_rank, HIDDEN, FFN * 2),
+               "DiT low-rank MLP-input fusion");
+            fc1_weight = dit->lr_scratch_wide;
+        }
+        if (weight->fc2_rank) {
+            OP(h3_gpu_lowrank_fuse(dit->gpu, dit->lr_scratch_narrow, 0,
+                                   weight->fc2_down, weight->fc2_up,
+                                   weight->fc2_rank, FFN, HIDDEN),
+               "DiT low-rank MLP-output fusion");
+            fc2_weight = dit->lr_scratch_narrow;
+        }
+    }
+    if (convrot && block_int8_mlp) {
         /* The fused MLP produces fc2's input (the SwiGLU activation) inside the
          * kernel, so the rotation cannot be applied there. Two INT8 GEMMs around
          * an explicit SwiGLU is the same math. */
@@ -2587,7 +2797,53 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->fc2_int8, weight->fc2_scales, rows, FFN, HIDDEN,
             dit->use_slower_uncached_int8_scales, 0),
            "DiT int8 MLP output");
-    } else if (dit->int8_mlp &&
+    } else if (dit->int8_mlp && (weight->fc1_int8 || weight->fc2_int8)) {
+        /* HyperFlow Flash leaves two blocks with one half of the MLP quantized
+         * and the other factorized (block 2 has an INT8 fc2, block 46 an INT8
+         * fc1), so neither fused kernel fits.  Each projection keeps its own
+         * precision, and only the INT8 half needs the ConvRot activation
+         * rotation: the factorized BF16 factors are stored unrotated. */
+        if (weight->fc1_int8) {
+            const h3_gpu_tensor *fc1_input = dit->mod_mlp;
+            if (convrot) {
+                OP(h3_gpu_convrot_rotate_bf16(dit->gpu, convrot_scratch,
+                                              dit->mod_mlp, rows, HIDDEN),
+                   "DiT ConvRot MLP-input rotation");
+                fc1_input = convrot_scratch;
+            }
+            OP(h3_gpu_linear_int8_bf16(
+                dit->gpu, dit->fc1, dit->int8_activation,
+                dit->int8_activation_scales, fc1_input,
+                weight->fc1_int8, weight->fc1_scales, rows, HIDDEN, FFN * 2,
+                dit->use_slower_uncached_int8_scales, 0),
+               "DiT int8 MLP input");
+        } else {
+            OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, fc1_weight,
+                                  NULL, rows, HIDDEN, FFN * 2),
+               "DiT MLP input");
+        }
+        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT SwiGLU");
+        if (weight->fc2_int8) {
+            const h3_gpu_tensor *fc2_input = dit->activated;
+            if (convrot) {
+                OP(h3_gpu_convrot_rotate_bf16(dit->gpu, convrot_scratch,
+                                              dit->activated, rows, FFN),
+                   "DiT ConvRot MLP-output rotation");
+                fc2_input = convrot_scratch;
+            }
+            OP(h3_gpu_linear_int8_bf16(
+                dit->gpu, mlp_output, dit->int8_activation,
+                dit->int8_activation_scales, fc2_input,
+                weight->fc2_int8, weight->fc2_scales, rows, FFN, HIDDEN,
+                dit->use_slower_uncached_int8_scales, 0),
+               "DiT int8 MLP output");
+        } else {
+            OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
+                                  fc2_weight, NULL, rows, FFN, HIDDEN),
+               "DiT MLP output");
+        }
+    } else if (block_int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
@@ -2603,19 +2859,19 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            "DiT int8 fused MLP");
     } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
-            dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
+            dit->mod_mlp, fc1_weight, fc2_weight, rows, HIDDEN, FFN,
             HIDDEN), "DiT NAX fused MLP");
     } else if (dit->fused_mlp) {
         OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
-            weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
+            fc1_weight, fc2_weight, rows, HIDDEN, FFN, HIDDEN),
            "DiT fused MLP");
     } else {
-        OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, fc1_weight,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
         OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT SwiGLU");
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
-            weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+            fc2_weight, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
@@ -2849,9 +3105,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
         unsigned fbc_probe = dit->fbc_enabled ? first_active_block(dit)
-                                              : H3_DIT_BLOCKS;
+                                              : dit->block_count;
         int fbc_skipped = 0;
-        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        for (unsigned block = 0; block < dit->block_count; block++) {
             int fused_token_adaln = carried_attention_adaln;
             int fused_attention_input_quantized =
                 carried_attention_input_quantized;
@@ -2885,7 +3141,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                  next_block == token_reduction_end);
             int fuse_next_attention =
                 !getenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN") &&
-                next_block < H3_DIT_BLOCKS &&
+                next_block < dit->block_count &&
                 dit->block_active[next_block] && !next_is_token_boundary;
             h3_dit_block streamed_weight;
             h3_dit_block *weight = &dit->blocks[block];
@@ -2910,7 +3166,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 weight = &streamed_weight;
 
                 unsigned future = next_active_block(dit, block);
-                if (future == H3_DIT_BLOCKS)
+                if (future == dit->block_count)
                     future = first_active_block(dit);
                 stream_job = (h3_dit_stream_job){
                     .dit = dit,
@@ -2990,11 +3246,12 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
             }
         }
-        if (dit->fbc_enabled && !fbc_skipped && fbc_probe < H3_DIT_BLOCKS &&
+        if (dit->fbc_enabled && !fbc_skipped &&
+            fbc_probe < dit->block_count &&
             !fbc_store_tail(dit, hidden_elements, error, error_size))
             return 0;
         if (use_token_reduction &&
-            token_reduction_end == H3_DIT_BLOCKS &&
+            token_reduction_end == dit->block_count &&
             !leave_token_reduction(dit, error, error_size)) return 0;
         if (dit->core_reuse_interval > 1) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
@@ -3380,7 +3637,7 @@ int h3_dit_rebind(h3_dit *dit,
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
-                              H3_DIT_BLOCKS);
+                              dit->block_count);
     }
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
@@ -3986,10 +4243,12 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->reduced_rope_sin);
     free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
     free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+    for (unsigned block = 0; block < dit->block_count; block++)
         free_block(&dit->blocks[block]);
     free_block(&dit->stream_slots[0]);
     free_block(&dit->stream_slots[1]);
+    free_tensor(&dit->lr_scratch_wide);
+    free_tensor(&dit->lr_scratch_narrow);
     free_tensor(&dit->final_norm);
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);

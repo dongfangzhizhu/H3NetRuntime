@@ -23,8 +23,23 @@
     <button class="btn btn-ghost" id="btnPreload" title="预读 DiT 权重，首次生成更快">预热模型</button>
     <button class="btn btn-ghost" id="btnCache">清缓存</button>
     <button class="btn btn-ghost" id="btnRefresh">刷新状态</button>
+    <a class="btn btn-ghost" href="/guide.html" target="_blank" rel="noreferrer"
+       title="模型权重下载与安装说明">模型指引</a>
   </div>
 </header>
+
+<!-- Shown until the weights are found: the first thing a new install needs. -->
+<section class="banner" id="modelBanner" hidden>
+  <div class="bannerbody">
+    <b id="bannerTitle">还没有找到模型权重</b>
+    <p id="bannerText"></p>
+    <div class="bannerlist" id="bannerMissing"></div>
+  </div>
+  <div class="banneractions">
+    <a class="btn btn-primary btn-sm" href="/guide.html" target="_blank" rel="noreferrer">下载指引</a>
+    <button class="btn btn-ghost btn-sm" id="btnRecheck">重新检测</button>
+  </div>
+</section>
 
 <main class="layout">
 
@@ -37,6 +52,19 @@
       </div>
       <textarea id="prompt" rows="5" spellcheck="false"
         placeholder="例：一只橘猫坐在窗台上，午后的阳光透过百叶窗，镜头缓慢推近，画面温暖安静"></textarea>
+    </div>
+
+    <div class="field" id="modeField">
+      <div class="labelrow"><label>生成方式</label><span class="hint" id="modeHint"></span></div>
+      <div class="modes" id="modes"></div>
+    </div>
+
+    <div class="field" id="demoField" hidden>
+      <div class="labelrow">
+        <label>示例</label>
+        <span class="hint">点一下套用提示词与规格，再按需改一两处</span>
+      </div>
+      <div class="demos" id="demos"></div>
     </div>
 
     <div class="field" id="presetField">
@@ -63,11 +91,13 @@
           </div>
         </label>
         <label class="control">
-          <span>生成方式</span>
-          <select id="mode">
-            <option value="t2v">文生视频</option>
-            <option value="fl2v">首尾帧（FL2VA）</option>
-          </select>
+          <span>实时预览</span>
+          <div class="row">
+            <label class="switch inline">
+              <input type="checkbox" id="livePreview" checked />
+              <span>每 4 帧回传一张</span>
+            </label>
+          </div>
         </label>
       </div>
     </div>
@@ -88,10 +118,13 @@
       </div>
     </div>
 
-    <label class="switch">
-      <input type="checkbox" id="livePreview" checked />
-      <span>实时预览（每 N 帧回传一张）</span>
-    </label>
+    <div class="field" id="refField" hidden>
+      <div class="labelrow">
+        <label>参考图</label>
+        <span class="hint" id="refImageHint">按顺序生效，最多 9 张</span>
+      </div>
+      <div class="refgrid" id="refGrid"></div>
+    </div>
 
     <!-- advanced -->
     <details class="advanced" id="advancedPanel">
@@ -166,17 +199,23 @@
         </div>
 
         <div class="labelrow">
-          <label>参考素材（Ref2VA）</label>
+          <label>参考视频 / 音频（Ref2VA）</label>
           <span class="hint" id="refHint"></span>
         </div>
         <div class="reflist" id="refList"></div>
-        <button class="btn btn-ghost btn-sm" id="btnAddRef">+ 添加参考图 / 视频 / 音频</button>
+        <button class="btn btn-ghost btn-sm" id="btnAddRef">+ 添加参考视频 / 音频</button>
 
         <div class="labelrow"><label>模型包</label></div>
         <div class="row">
           <select id="packSelect"></select>
           <button class="btn btn-ghost btn-sm" id="btnSwitchPack">切换</button>
         </div>
+
+        <div class="labelrow" id="componentLabel">
+          <label>模型组件</label>
+          <span class="hint">逐个权重文件的解析结果</span>
+        </div>
+        <div class="components" id="components"></div>
 
         <label class="switch"><input type="checkbox" id="advRawJson" /><span>显示原始结果 JSON</span></label>
       </div>
@@ -208,6 +247,7 @@
         <span id="phaseText">空闲</span>
         <span id="progressText"></span>
       </div>
+      <div class="stageStrip" id="stageStrip" hidden></div>
     </div>
 
     <div class="resultbar" id="resultbar" hidden>
@@ -228,6 +268,9 @@
       <summary>原始 JSON</summary>
       <pre id="rawJson"></pre>
     </details>
+
+    <!-- 高级版把「模型组件」挪到这里：右栏在预览下面本来是空的 -->
+    <div id="stageExtra" hidden></div>
   </section>
 </main>
 

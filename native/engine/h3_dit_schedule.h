@@ -9,8 +9,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The unpruned depth.  It is only a default: HyperFlow Flash drops whole
+ * blocks and renumbers the rest (fl2va keeps 47, ref2va 49), so the depth is
+ * read from the checkpoint and H3_DIT_MAX_BLOCKS bounds the arrays. */
 #define H3_DIT_BLOCKS 50u
+#define H3_DIT_MAX_BLOCKS H3_WEIGHT_MAX_BLOCKS
 #define H3_DIT_HIDDEN 5376u
+/* Width of the released 256-wide time embedder's output.  It is only the
+ * default: the real width is read from the checkpoint, because HyperFlow Flash
+ * prunes the embedder to rank 16 and the curve family to rank 8. */
 #define H3_DIT_TIME_DIM 2688u
 #define H3_DIT_MODALITIES 3u
 #define H3_DIT_ADALN_SLOTS 6u

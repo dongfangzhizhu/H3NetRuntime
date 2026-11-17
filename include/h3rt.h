@@ -95,13 +95,42 @@ H3RT_API void H3RT_CALL h3rt_free_string(char *text);
 /* options_json (UTF-8, may be NULL):
  *   { "model_dir": "D:/models/pdd8",   MiniMax-H3 pack (FL2VA/ ...)
  *     "config": "D:/.../h3.config.json", optional path-table file
+ *     "models": { ... },               optional per-component overrides
+ *     "pack_cache_dir": "...",         where composed link packs live
  *     "text_cache_dir": "...",         optional on-disk prompt cache
  *     "cache_enabled": true,           reuse resident weights / embeddings
  *     "keep_dit": true }               keep the DiT mapped between calls
  *
  * Precedence for the model directory: model_dir -> config.h3_dir ->
- * "~/h3-models/pdd8".  `error` may be NULL; when it is not, it receives the
- * failure message even though no handle was produced.
+ * "~/h3-models/pdd8" (the last one is skipped when "models" is used, because
+ * the components may come from anywhere).
+ *
+ * "models" names each weight component independently.  Every value is either a
+ * directory holding that component's files, or, except for the tokenizer, a
+ * single .safetensors that is linked in as model.safetensors (any small
+ * sidecar the same slot has under model_dir, such as config.json or
+ * pdd_heads.safetensors, is linked next to it):
+ *   { "text_encoder": "...",          -> FL2VA/text_encoder
+ *     "transformer": "...",           -> FL2VA/transformer
+ *     "video_vae": "...",             -> FL2VA/video_vae/source
+ *     "audio_vae": "...",             -> FL2VA/audio_vae
+ *     "tokenizer": "...",             -> FL2VA/tokenizer
+ *     "pdd_lora": "...",              -> FL2VA/pdd_lora.safetensors
+ *     "ref2va_transformer": "...",    -> Ref2VA/transformer
+ *     "ref2va_text_encoder": "...",   -> Ref2VA/text_encoder
+ *     "ref2va_video_vae": "...",      -> Ref2VA/video_vae/source
+ *     "ref2va_audio_vae": "...",      -> Ref2VA/audio_vae
+ *     "ref2va_tokenizer": "..." }     -> Ref2VA/tokenizer
+ *
+ * The engine reads one pack root, so h3rt materialises that layout as links
+ * (junctions on Windows, symlinks on Linux) inside a content-addressed
+ * directory under pack_cache_dir, and loads that.  Components left out fall
+ * back to the same slot under model_dir.  When every component already sits at
+ * its standard location no links are created and model_dir is used directly.
+ * A manifest of the links is written to <pack>/h3rt-pack.json.
+ *
+ * `error` may be NULL; when it is not, it receives the failure message even
+ * though no handle was produced.
  */
 H3RT_API int H3RT_CALL h3rt_create(const char *options_json,
                                    h3rt_handle **out_handle,

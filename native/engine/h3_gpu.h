@@ -413,6 +413,29 @@ int h3_gpu_linear_bf16_accum(h3_gpu *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *weight, uint32_t rows,
                              uint32_t input_dim, uint32_t output_dim);
 
+/* Expand a factorized linear into a dense row-major [output_dim][input_dim]
+ * matrix at row `output_row_offset`:
+ *   output[offset + row][column] = sum_r up[row][r] * down[r][column]
+ *
+ * HyperFlow Flash stores 17 of its 47 blocks as BF16 `down`/`up` pairs instead
+ * of a dense projection.  A resident dense copy of those blocks would cost
+ * another 6.5 GiB, so each projection is expanded into one shared scratch
+ * matrix right before it is used and the ordinary kernels stay unchanged.
+ * The row offset lets one call fill one third of a fused qkv matrix. */
+int h3_gpu_lowrank_fuse(h3_gpu *gpu, h3_gpu_tensor *output,
+                        uint32_t output_row_offset, const h3_gpu_tensor *down,
+                        const h3_gpu_tensor *up, uint32_t rank,
+                        uint32_t input_dim, uint32_t output_dim);
+
+/* The same fusion for `rows` output rows of `up` starting at `up_row_offset`.
+ * The QKV kernel reads per-head triples, so a factorized q/k/v projection is
+ * scattered head by head instead of written as three contiguous thirds. */
+int h3_gpu_lowrank_fuse_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                             uint32_t output_row_offset, uint32_t rows,
+                             const h3_gpu_tensor *down,
+                             const h3_gpu_tensor *up, uint32_t up_row_offset,
+                             uint32_t rank, uint32_t input_dim);
+
 /* Expand one packed Nunchaku int4 matrix (h3_nunchaku_packed) into the BF16
  * weight buffer a linear consumes.  This is what lets a 4-bit pack cost a
  * quarter of the VRAM instead of the same as BF16: the codes stay packed on the

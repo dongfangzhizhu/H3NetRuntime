@@ -1,5 +1,6 @@
-# Keep vendored upstream sources byte-identical (no EOL rewriting), so the
-# snapshot can be diffed against h3-spark.c rev a474eca without noise.
+# Vendored engine sources are kept without EOL rewriting. This repository
+# carries local HyperFlow/ComfyUI-V8 fixes on top of the a474eca snapshot;
+# see native/engine/ORIGIN.md for the list.
 native/engine/** -text
 
 # Windows batch files must keep CRLF.

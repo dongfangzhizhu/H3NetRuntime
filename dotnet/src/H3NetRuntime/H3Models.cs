@@ -9,6 +9,20 @@ public sealed class H3RuntimeOptions
     /// <summary>MiniMax-H3 pack containing FL2VA/ (and optionally Ref2VA/).</summary>
     public string? ModelDir { get; set; }
 
+    /// <summary>
+    /// Per-component weight paths. Use this when the checkpoints live in
+    /// different directories (a DiT from one release, a text encoder from
+    /// another); anything left unset falls back to <see cref="ModelDir"/>.
+    /// </summary>
+    public H3ModelPaths? Models { get; set; }
+
+    /// <summary>
+    /// Directory for the link packs built from <see cref="Models"/>. Defaults
+    /// to <c>%TEMP%/h3rt-packs</c> (Linux: <c>$TMPDIR/h3rt-packs</c>). Point it
+    /// at the same volume as the weights so component links stay free.
+    /// </summary>
+    public string? PackCacheDir { get; set; }
+
     /// <summary>Optional h3.config.json with platform-specific pack paths.</summary>
     public string? ConfigPath { get; set; }
 
@@ -29,6 +43,8 @@ public sealed class H3RuntimeOptions
         var values = new Dictionary<string, object?>
         {
             ["model_dir"] = ModelDir,
+            ["models"] = Models?.ToDictionary(),
+            ["pack_cache_dir"] = PackCacheDir,
             ["config"] = ConfigPath,
             ["text_cache_dir"] = TextCacheDir,
             ["cache_enabled"] = CacheEnabled,
@@ -42,6 +58,77 @@ public sealed class H3RuntimeOptions
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
+}
+
+/// <summary>
+/// One path per weight component. Each value is a directory that already holds
+/// the files the engine expects for that component; <see cref="PddLora"/> is a
+/// single <c>.safetensors</c> file.
+/// </summary>
+/// <remarks>
+/// The engine reads a single pack root, so the runtime assembles the standard
+/// layout as links (NTFS junctions on Windows, symlinks on Linux) in a
+/// content-addressed directory and loads that. Nothing is copied unless a file
+/// cannot be linked at all.
+/// </remarks>
+public sealed class H3ModelPaths
+{
+    /// <summary>Qwen3-VL text encoder (<c>FL2VA/text_encoder</c>).</summary>
+    public string? TextEncoder { get; set; }
+
+    /// <summary>FL2VA INT8 DiT directory: config.json + model.safetensors (<c>FL2VA/transformer</c>).</summary>
+    public string? Transformer { get; set; }
+
+    /// <summary>
+    /// Video VAE weights (<c>FL2VA/video_vae/source</c>). Pointing at the
+    /// parent <c>video_vae</c> directory that contains <c>source/</c> works too.
+    /// </summary>
+    public string? VideoVae { get; set; }
+
+    /// <summary>Audio VAE weights (<c>FL2VA/audio_vae</c>).</summary>
+    public string? AudioVae { get; set; }
+
+    /// <summary>Tokenizer files: tokenizer.json, tokenizer_config.json, vocab.json (<c>FL2VA/tokenizer</c>).</summary>
+    public string? Tokenizer { get; set; }
+
+    /// <summary>PDD 8-step adaptor (<c>FL2VA/pdd_lora.safetensors</c>).</summary>
+    public string? PddLora { get; set; }
+
+    /// <summary>Ref2VA DiT directory, needed for reference-conditioned video.</summary>
+    public string? Ref2vaTransformer { get; set; }
+
+    public string? Ref2vaTextEncoder { get; set; }
+    public string? Ref2vaVideoVae { get; set; }
+    public string? Ref2vaAudioVae { get; set; }
+    public string? Ref2vaTokenizer { get; set; }
+
+    /// <summary>True when at least one component path is set.</summary>
+    [JsonIgnore]
+    public bool IsEmpty =>
+        TextEncoder is null && Transformer is null && VideoVae is null &&
+        AudioVae is null && Tokenizer is null && PddLora is null &&
+        Ref2vaTransformer is null && Ref2vaTextEncoder is null &&
+        Ref2vaVideoVae is null && Ref2vaAudioVae is null &&
+        Ref2vaTokenizer is null;
+
+    internal Dictionary<string, object?>? ToDictionary()
+    {
+        var values = new Dictionary<string, object?>
+        {
+            ["text_encoder"] = TextEncoder,
+            ["transformer"] = Transformer,
+            ["video_vae"] = VideoVae,
+            ["audio_vae"] = AudioVae,
+            ["tokenizer"] = Tokenizer,
+            ["pdd_lora"] = PddLora,
+            ["ref2va_transformer"] = Ref2vaTransformer,
+            ["ref2va_text_encoder"] = Ref2vaTextEncoder,
+            ["ref2va_video_vae"] = Ref2vaVideoVae,
+            ["ref2va_audio_vae"] = Ref2vaAudioVae,
+            ["ref2va_tokenizer"] = Ref2vaTokenizer
+        };
+        return IsEmpty ? null : values;
+    }
 }
 
 /// <summary>One ordered reference (Ref2VA / multi-modal conditioning).</summary>

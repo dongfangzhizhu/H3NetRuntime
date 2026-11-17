@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -11,5 +11,68 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
+
+  <!-- NuGet packaging metadata -->
+  <PropertyGroup>
+    <PackageId>H3NetRuntime</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>h3rt contributors</Authors>
+    <Company>h3rt</Company>
+    <Product>H3 .NET Runtime</Product>
+    <Description>
+      Runs MiniMax-H3 / HyperFlow H3 Flash video+audio generation in-process from
+      .NET: no Python, no ComfyUI, no HTTP hop. The native h3rt library (CUDA)
+      ships inside this package for Windows and Linux.
+    </Description>
+    <PackageTags>minimax;h3;hyperflow;video-generation;diffusion;cuda;native;pinvoke</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>PACKAGE.md</PackageReadmeFile>
+    <PackageReleaseNotes>1.0.0 — per-component model paths, first/last frame and reference conditioning, native runtimes for win-x64 and linux-x64.</PackageReleaseNotes>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Deterministic>true</Deterministic>
+    <Copyright>Copyright 2026 h3rt contributors</Copyright>
+    <RepositoryType>git</RepositoryType>
+    <!-- GitHub Actions exposes GITHUB_REPOSITORY as owner/name, so the
+         published package points back to the right repository automatically. -->
+    <RepositoryUrl Condition="'$(RepositoryUrl)' == '' and '$(GITHUB_REPOSITORY)' != ''">https://github.com/$(GITHUB_REPOSITORY)</RepositoryUrl>
+    <PackageProjectUrl Condition="'$(PackageProjectUrl)' == '' and '$(RepositoryUrl)' != ''">$(RepositoryUrl)</PackageProjectUrl>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)..\..\..\dist\nuget</PackageOutputPath>
+  </PropertyGroup>
+
+  <!--
+    The native runtime is packed as a standard NuGet native asset, so a
+    consuming app gets runtimes/<rid>/native/h3rt.dll (or libh3rt.so) in its
+    output folder and NativeMethods finds it there. `dist/` is produced by
+    scripts/build-native.cmd (Windows) or scripts/build.sh (Linux); the pack
+    script refuses to run when neither exists, because a managed-only package
+    would fail at the first P/Invoke.
+  -->
+  <ItemGroup>
+    <None Include="..\..\..\dist\win-x64\h3rt.dll"
+          Pack="true" PackagePath="runtimes/win-x64/native/"
+          Visible="false" Condition="Exists('..\..\..\dist\win-x64\h3rt.dll')" />
+    <None Include="..\..\..\dist\linux-x64\libh3rt.so"
+          Pack="true" PackagePath="runtimes/linux-x64/native/"
+          Visible="false" Condition="Exists('..\..\..\dist\linux-x64\libh3rt.so')" />
+    <None Include="..\..\..\include\h3rt.h"
+          Pack="true" PackagePath="build/native/include/"
+          Visible="false" Condition="Exists('..\..\..\include\h3rt.h')" />
+    <!--
+      The Qwen3-VL tokenizer is the one input the five released ComfyUI model
+      files do not include, and h3rt cannot tokenize a prompt without it. It is
+      shipped as a native asset so it lands next to h3rt.dll in the consumer's
+      output folder, which is one of the places h3rt searches automatically.
+    -->
+    <None Include="..\..\..\assets\tokenizer\tokenizer.json"
+          Pack="true" PackagePath="runtimes/win-x64/native/tokenizer/"
+          Visible="false" Condition="Exists('..\..\..\assets\tokenizer\tokenizer.json')" />
+    <None Include="..\..\..\assets\tokenizer\tokenizer.json"
+          Pack="true" PackagePath="runtimes/linux-x64/native/tokenizer/"
+          Visible="false" Condition="Exists('..\..\..\assets\tokenizer\tokenizer.json')" />
+    <None Include="PACKAGE.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="..\..\..\NOTICE" Pack="true" PackagePath="\" Visible="false"
+          Condition="Exists('..\..\..\NOTICE')" />
+  </ItemGroup>
 
 </Project>

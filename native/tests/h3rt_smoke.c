@@ -58,11 +58,16 @@ int main(int argc, char **argv) {
     check(out == NULL, "out_json cleared on argument failure");
 
     if (argc > 1) {
-        char options[1024];
-        snprintf(options, sizeof(options), "{\"model_dir\":\"%s\"}", argv[1]);
+        /* A pack path is the common case; a JSON object is used verbatim so
+         * the per-component path options can be exercised too. */
+        static char options[8192];
+        if (argv[1][0] == '{')
+            snprintf(options, sizeof(options), "%s", argv[1]);
+        else
+            snprintf(options, sizeof(options), "{\"model_dir\":\"%s\"}", argv[1]);
         error[0] = '\0';
         int rc = h3rt_create(options, &handle, error, sizeof(error));
-        printf("h3rt_create(%s) = %d %s\n", argv[1], rc,
+        printf("h3rt_create(%s) = %d %s\n", options, rc,
                h3rt_status_text(rc));
         if (rc != H3RT_OK) {
             printf("  error: %s\n", error);

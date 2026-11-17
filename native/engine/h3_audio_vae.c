@@ -193,19 +193,35 @@ static int load_normalized_conv(audio_context *audio, audio_conv *conv,
     conv->dilation = dilation;
     conv->stride = stride;
     conv->transpose = transpose;
+    /* The ComfyUI release stores the folded weight directly: the AudioVAE was
+     * exported after weight normalization, so `weight_v`/`weight_g` are gone
+     * and `weight` is the matrix the fold would have produced. */
     snprintf(name, sizeof(name), "%s.weight_v", prefix);
     conv->vector = f3(audio, name, outer, inner_channels, kernel,
                       error, error_size);
-    if (!conv->vector) return 0;
-    snprintf(name, sizeof(name), "%s.weight_g", prefix);
-    conv->magnitude = f3(audio, name, outer, 1, 1, error, error_size);
-    if (!conv->magnitude) return 0;
-    size_t elements = (size_t)outer * inner_channels * kernel;
-    conv->weight = h3_gpu_tensor_new_f32(audio->gpu, elements);
-    if (!conv->weight) {
-        fail(error, error_size, "cannot allocate normalized %s weight: %s",
-             prefix, h3_gpu_error(audio->gpu));
-        return 0;
+    if (!conv->vector) {
+        char detail[256];
+        detail[0] = '\0';
+        snprintf(name, sizeof(name), "%s.weight", prefix);
+        conv->weight = f3(audio, name, outer, inner_channels, kernel, detail,
+                          sizeof(detail));
+        if (!conv->weight) {
+            fail(error, error_size,
+                 "required weight is absent: %s.weight_v (and %s.weight: %s)",
+                 prefix, prefix, detail);
+            return 0;
+        }
+    } else {
+        snprintf(name, sizeof(name), "%s.weight_g", prefix);
+        conv->magnitude = f3(audio, name, outer, 1, 1, error, error_size);
+        if (!conv->magnitude) return 0;
+        size_t elements = (size_t)outer * inner_channels * kernel;
+        conv->weight = h3_gpu_tensor_new_f32(audio->gpu, elements);
+        if (!conv->weight) {
+            fail(error, error_size, "cannot allocate normalized %s weight: %s",
+                 prefix, h3_gpu_error(audio->gpu));
+            return 0;
+        }
     }
     if (has_bias) {
         snprintf(name, sizeof(name), "%s.bias", prefix);
@@ -217,6 +233,8 @@ static int load_normalized_conv(audio_context *audio, audio_conv *conv,
 
 static int normalize_conv(audio_context *audio, audio_conv *conv,
                           char *error, size_t error_size) {
+    /* A pre-folded checkpoint already holds the normalized weight. */
+    if (!conv->magnitude) return 1;
     uint32_t outer = conv->transpose ? conv->input_channels :
                                       conv->output_channels;
     uint32_t inner_channels = conv->transpose ? conv->output_channels :
@@ -309,11 +327,24 @@ static int load_latent_normalization(const char *weight_directory,
     snprintf(path, path_size, "%s/config.json", weight_directory);
     FILE *file = fopen(path, "rb");
     if (!file || fseek(file, 0, SEEK_END)) {
-        fail(error, error_size, "cannot open audio VAE config %s: %s", path,
-             strerror(errno));
+        /* The ComfyUI release ships no config.json: the AudioVAE keeps its
+         * latent normalization as `latents_mean` / `latents_std` tensors in
+         * the checkpoint itself, which is where ComfyUI reads them too. */
         if (file) fclose(file);
         free(path);
-        return 0;
+        int ok = h3_weight_read_f32_vector(weight_directory, "latents_mean",
+                                           mean, LATENT_CHANNELS, error,
+                                           error_size) &&
+                 h3_weight_read_f32_vector(weight_directory, "latents_std",
+                                           deviation, LATENT_CHANNELS, error,
+                                           error_size);
+        if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+            if (deviation[channel] <= 0.0f) {
+                fail(error, error_size,
+                     "audio VAE latent standard deviation is invalid");
+                return 0;
+            }
+        return ok;
     }
     long end = ftell(file);
     if (end < 1 || end > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {

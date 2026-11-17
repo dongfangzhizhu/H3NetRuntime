@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build .NET solution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore dotnet/H3NetRuntime.sln
+
+      - name: Build
+        run: dotnet build dotnet/H3NetRuntime.sln -c Release --no-restore
+
+      # Native binaries and the tokenizer are checked in, so pack also verifies
+      # that the repository carries everything a consumer needs.
+      - name: Pack
+        run: dotnet pack dotnet/src/H3NetRuntime/H3NetRuntime.csproj -c Release --no-build -o artifacts
+
+      - name: Verify package assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=$(ls artifacts/*.nupkg | head -n 1)
+          echo "Checking $PKG"
+          unzip -l "$PKG" | grep -E 'runtimes/win-x64/native/h3rt.dll'
+          unzip -l "$PKG" | grep -E 'runtimes/linux-x64/native/libh3rt.so'
+          unzip -l "$PKG" | grep -E 'runtimes/(win|linux)-x64/native/tokenizer/tokenizer.json'
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+          if-no-files-found: error

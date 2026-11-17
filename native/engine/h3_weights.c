@@ -1,5 +1,7 @@
 #include "h3_weights.h"
 
+#include "h3_gguf.h"
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -12,6 +14,14 @@
 struct h3_weight_store {
     h3_st_header *headers;
     size_t count;
+    /* Non-NULL when the component is a single GGUF container instead of a
+     * safetensors shard set (the released Q4_K_M text encoder). */
+    h3_gguf *gguf;
+    /* GGUF lookups synthesise an h3_st_tensor; a small ring keeps two live
+     * lookups (weight + scale sidecar) from clobbering each other. */
+    h3_st_tensor gguf_slots[4];
+    h3_st_header gguf_header;
+    unsigned gguf_next;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -68,6 +78,31 @@ static h3_weight_store *open_paths(char **paths, size_t count,
     return store;
 }
 
+static int gguf_name(const char *name) {
+    static const char suffix[] = ".gguf";
+    size_t length = strlen(name);
+    return length > sizeof(suffix) - 1 &&
+           strcmp(name + length - (sizeof(suffix) - 1), suffix) == 0;
+}
+
+/* A component that is one GGUF container.  The reader presents the tensors in
+ * torch layout under HF names, so everything above this point keeps working. */
+static h3_weight_store *open_gguf(const char *path, char *error,
+                                  size_t error_size) {
+    h3_gguf *gguf = h3_gguf_open(path, error, error_size);
+    if (!gguf) return NULL;
+    h3_weight_store *store = calloc(1, sizeof(*store));
+    if (!store) {
+        h3_gguf_free(gguf);
+        fail(error, error_size, "out of memory creating weight store");
+        return NULL;
+    }
+    store->gguf = gguf;
+    store->gguf_header.path = (char *)path;
+    store->gguf_header.tensor_count = h3_gguf_tensor_count(gguf);
+    return store;
+}
+
 h3_weight_store *h3_weight_store_open(const char *path,
                                       char *error, size_t error_size) {
     if (!path || !*path) {
@@ -87,8 +122,9 @@ h3_weight_store *h3_weight_store_open(const char *path,
     if (S_ISREG(info.st_mode)) {
         const char *name = strrchr(path, '/');
         name = name ? name + 1 : path;
+        if (gguf_name(name)) return open_gguf(path, error, error_size);
         if (!safetensors_name(name)) {
-            fail(error, error_size, "not a safetensors file: %s", path);
+            fail(error, error_size, "not a safetensors or gguf file: %s", path);
             return NULL;
         }
         char *single = malloc(strlen(path) + 1);
@@ -109,8 +145,24 @@ h3_weight_store *h3_weight_store_open(const char *path,
     char **paths = NULL;
     size_t count = 0;
     size_t capacity = 0;
+    char *gguf_path = NULL;
     struct dirent *entry;
     while ((entry = readdir(stream)) != NULL) {
+        if (gguf_name(entry->d_name)) {
+            /* A directory holding the text encoder may be a single GGUF plus
+             * tokenizer files; remember it and decide after the scan. */
+            free(gguf_path);
+            size_t length = strlen(path) + strlen(entry->d_name) + 2;
+            gguf_path = malloc(length);
+            if (!gguf_path) {
+                fail(error, error_size, "out of memory resolving the weight file");
+                closedir(stream);
+                free_paths(paths, count);
+                return NULL;
+            }
+            snprintf(gguf_path, length, "%s/%s", path, entry->d_name);
+            continue;
+        }
         if (!safetensors_name(entry->d_name)) continue;
         if (count == capacity) {
             size_t next = capacity ? capacity * 2 : 8;
@@ -137,10 +189,17 @@ h3_weight_store *h3_weight_store_open(const char *path,
     }
     closedir(stream);
     if (!count) {
-        fail(error, error_size, "no safetensors shards in %s", path);
         free(paths);
+        if (gguf_path) {
+            h3_weight_store *store = open_gguf(gguf_path, error, error_size);
+            free(gguf_path);
+            return store;
+        }
+        fail(error, error_size,
+             "no safetensors shards or .gguf file in %s", path);
         return NULL;
     }
+    free(gguf_path);
     qsort(paths, count, sizeof(*paths), compare_paths);
     h3_weight_store *store = open_paths(paths, count, error, error_size);
     free_paths(paths, count);
@@ -153,6 +212,7 @@ void h3_weight_store_free(h3_weight_store *store) {
         h3_st_free_header(&store->headers[index]);
     }
     free(store->headers);
+    h3_gguf_free(store->gguf);
     free(store);
 }
 
@@ -165,6 +225,28 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
                                    const h3_st_header **header) {
     if (header) *header = NULL;
     if (!store || !name) return NULL;
+    if (store->gguf) {
+        int index = h3_gguf_find(store->gguf, name);
+        if (index < 0) return NULL;
+        h3_weight_store *mutable = (h3_weight_store *)store;
+        h3_st_tensor *slot = &mutable->gguf_slots[mutable->gguf_next++ % 4];
+        memset(slot, 0, sizeof(*slot));
+        slot->name = (char *)h3_gguf_tensor_name(store->gguf, (size_t)index);
+        h3_gguf_type type = h3_gguf_tensor_type(store->gguf, (size_t)index);
+        slot->dtype = type == H3_GGUF_F32 ? H3_DTYPE_F32
+                     : type == H3_GGUF_F16 ? H3_DTYPE_F16
+                     : H3_DTYPE_BF16;
+        slot->ndim = h3_gguf_tensor_rank(store->gguf, (size_t)index);
+        const uint64_t *shape = h3_gguf_tensor_shape(store->gguf, (size_t)index);
+        for (int dimension = 0; dimension < slot->ndim && dimension < 8; dimension++)
+            slot->shape[dimension] = shape[dimension];
+        /* The GGUF reader dequantises into host memory; file_offset carries the
+         * tensor index instead of a byte offset so load_tensor can tell the
+         * two paths apart. */
+        slot->file_offset = (uint64_t)index;
+        if (header) *header = &mutable->gguf_header;
+        return slot;
+    }
     for (size_t index = 0; index < store->count; index++) {
         const h3_st_tensor *tensor = h3_st_find(&store->headers[index], name);
         if (tensor) {
@@ -184,6 +266,56 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
     if (!tensor) {
         fail(error, error_size, "required weight is absent: %s", name);
         return NULL;
+    }
+    if (store->gguf) {
+        /* GGUF: quantized codes are dequantised on the host, so the stored
+         * dtype is not the requested one and the payload has no byte offset. */
+        if (tensor->ndim != ndim) {
+            fail(error, error_size, "weight %s has rank %d, expected %d", name,
+                 tensor->ndim, ndim);
+            return NULL;
+        }
+        uint64_t elements = 1;
+        for (int dimension = 0; dimension < ndim; dimension++) {
+            if (tensor->shape[dimension] != shape[dimension]) {
+                fail(error, error_size,
+                     "weight %s shape [%llu] does not match the expected [%llu]",
+                     name, (unsigned long long)tensor->shape[dimension],
+                     (unsigned long long)shape[dimension]);
+                return NULL;
+            }
+            elements *= shape[dimension];
+        }
+        if (elements > SIZE_MAX / sizeof(float)) {
+            fail(error, error_size, "weight %s is too large for this process",
+                 name);
+            return NULL;
+        }
+        size_t index = (size_t)tensor->file_offset;
+        h3_gpu_tensor *result = NULL;
+        if (dtype == H3_DTYPE_BF16) {
+            uint16_t *host = malloc((size_t)elements * sizeof(uint16_t));
+            if (!host) {
+                fail(error, error_size, "out of memory dequantising %s", name);
+                return NULL;
+            }
+            if (h3_gguf_read_bf16(store->gguf, index, host, error, error_size))
+                result = h3_gpu_tensor_from_bf16(gpu, host, (size_t)elements);
+            free(host);
+        } else {
+            float *host = malloc((size_t)elements * sizeof(float));
+            if (!host) {
+                fail(error, error_size, "out of memory dequantising %s", name);
+                return NULL;
+            }
+            if (h3_gguf_read_f32(store->gguf, index, host, error, error_size))
+                result = h3_gpu_tensor_from_f32(gpu, host, (size_t)elements);
+            free(host);
+        }
+        if (!result && (!error || !*error))
+            fail(error, error_size, "cannot upload %s: %s", name,
+                 h3_gpu_error(gpu));
+        return result;
     }
     if (tensor->dtype != dtype || tensor->ndim != ndim) {
         fail(error, error_size, "weight %s has dtype/rank %s/%d, expected %s/%d",
@@ -225,6 +357,134 @@ h3_gpu_tensor *h3_weight_load_bf16(const h3_weight_store *store, h3_gpu *gpu,
                                    char *error, size_t error_size) {
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_BF16,
                        error, error_size);
+}
+
+int h3_weight_is_gguf(const h3_weight_store *store) {
+    return store && store->gguf != NULL;
+}
+
+unsigned h3_weight_block_count(const h3_weight_store *store) {
+    if (!store) return 0;
+    unsigned count = 0;
+    for (unsigned index = 0; index < H3_WEIGHT_MAX_BLOCKS; index++) {
+        char name[64];
+        snprintf(name, sizeof(name), "blocks.%u.norm1.weight", index);
+        if (!h3_weight_find(store, name, NULL)) break;
+        count = index + 1;
+    }
+    return count;
+}
+
+/* The video VAE keeps its normalization in F16, the audio VAE in F32, so the
+ * reader widens whichever float type the checkpoint happens to use. */
+static float half_to_f32(uint16_t bits) {
+    uint32_t sign = (uint32_t)(bits >> 15) & 1u;
+    uint32_t exponent = (uint32_t)(bits >> 10) & 0x1fu;
+    uint32_t mantissa = (uint32_t)bits & 0x3ffu;
+    uint32_t value;
+    if (!exponent) {
+        if (!mantissa) return sign ? -0.0f : 0.0f;
+        exponent = 1;
+        while (!(mantissa & 0x400u)) {
+            mantissa <<= 1;
+            exponent--;
+        }
+        mantissa &= 0x3ffu;
+        value = (sign << 31) | ((exponent + (127u - 15u)) << 23) |
+                (mantissa << 13);
+    } else if (exponent == 0x1fu) {
+        value = (sign << 31) | 0x7f800000u | (mantissa << 13);
+    } else {
+        value = (sign << 31) | ((exponent + (127u - 15u)) << 23) |
+                (mantissa << 13);
+    }
+    float result;
+    memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+static float stored_to_f32(uint16_t bits) {
+    uint32_t widened = (uint32_t)bits << 16;
+    float result;
+    memcpy(&result, &widened, sizeof(result));
+    return result;
+}
+
+int h3_weight_read_f32_vector(const char *directory, const char *name,
+                              float *values, size_t count,
+                              char *error, size_t error_size) {
+    if (!directory || !name || !values || !count) {
+        fail(error, error_size, "invalid F32 vector read request");
+        return 0;
+    }
+    h3_weight_store *store = h3_weight_store_open(directory, error, error_size);
+    if (!store) return 0;
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    int ok = tensor && header &&
+             (tensor->dtype == H3_DTYPE_F32 || tensor->dtype == H3_DTYPE_BF16 ||
+              tensor->dtype == H3_DTYPE_F16) &&
+             h3_st_tensor_elements(tensor) == count;
+    if (ok && tensor->dtype == H3_DTYPE_F32)
+        ok = h3_st_read_data(header, tensor, values, count * sizeof(*values),
+                             error, error_size);
+    else if (ok) {
+        size_t bytes = count * sizeof(uint16_t);
+        uint16_t *raw = malloc(bytes);
+        ok = raw && h3_st_read_data(header, tensor, raw, bytes, error,
+                                    error_size);
+        for (size_t index = 0; ok && index < count; index++)
+            values[index] = tensor->dtype == H3_DTYPE_F16 ?
+                half_to_f32(raw[index]) : stored_to_f32(raw[index]);
+        free(raw);
+    }
+    if (!ok && (!error || !*error))
+        fail(error, error_size,
+             "%s must be a F32/F16/BF16 [%zu] tensor in %s", name, count,
+             directory);
+    h3_weight_store_free(store);
+    return ok;
+}
+
+int h3_weight_read_into_bf16(const h3_weight_store *store, const char *name,
+                             h3_gpu_tensor *destination, size_t elements,
+                             char *error, size_t error_size) {
+    if (!store || !name || !destination) {
+        fail(error, error_size, "invalid weight read request");
+        return 0;
+    }
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || !header) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    if (store->gguf) {
+        /* A GGUF payload is quantised, so it has no BF16 bytes to read: the
+         * codes are dequantised on the host and uploaded. */
+        uint16_t *host = malloc(elements * sizeof(uint16_t));
+        if (!host) {
+            fail(error, error_size, "out of memory dequantising %s", name);
+            return 0;
+        }
+        int ok = h3_gguf_read_bf16(store->gguf, (size_t)tensor->file_offset,
+                                   host, error, error_size);
+        if (ok && !h3_gpu_tensor_write_bf16(destination, host, elements)) {
+            fail(error, error_size, "cannot upload %s", name);
+            ok = 0;
+        }
+        free(host);
+        return ok;
+    }
+    if (tensor->dtype != H3_DTYPE_BF16) {
+        fail(error, error_size,
+             "weight %s has dtype %s, expected BF16 or an int8 pair", name,
+             h3_dtype_name(tensor->dtype));
+        return 0;
+    }
+    return h3_gpu_tensor_read_file_bf16(destination, header->path,
+                                        tensor->file_offset, elements, error,
+                                        error_size);
 }
 
 h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,

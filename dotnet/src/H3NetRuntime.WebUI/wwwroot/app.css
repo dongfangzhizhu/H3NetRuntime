@@ -191,6 +191,29 @@ select { appearance: none; background-image: none; cursor: pointer; }
 .preset b { display: block; font-size: 13px; font-weight: 650; }
 .preset small { color: var(--muted); font-size: 11px; }
 
+/* Examples sit above the spec cards: they are the on-ramp, the spec is the
+ * dial. Two columns like the presets so the panel height stays predictable. */
+.demos { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+.demo {
+  text-align: left;
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px dashed var(--line-2);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.demo:hover { border-color: rgba(34, 211, 238, .6); background: rgba(34, 211, 238, .06); }
+.demo.active {
+  border-style: solid;
+  border-color: rgba(34, 211, 238, .85);
+  background: linear-gradient(180deg, rgba(34, 211, 238, .16), rgba(34, 211, 238, .04));
+}
+.demo b { display: block; font-size: 12.5px; font-weight: 650; }
+.demo small { color: var(--muted); font-size: 11px; }
+
 /* -------------------------------------------------------------- dropzone */
 .dropzone {
   position: relative;
@@ -417,6 +440,36 @@ select { appearance: none; background-image: none; cursor: pointer; }
   color: var(--muted);
 }
 
+/* Pipeline strip: which stage of the run is active, so a six-minute wait has a
+   visible shape instead of one number that jumps back to zero per phase. */
+.stageStrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+.stagechip {
+  font-size: 10.5px;
+  line-height: 1.6;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.stagechip.done {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--line));
+  background: color-mix(in srgb, var(--ok) 10%, var(--panel-2));
+}
+.stagechip.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+  background: color-mix(in srgb, var(--accent) 20%, var(--panel-2));
+}
+.stagechip.todo { opacity: .55; }
+
 /* ------------------------------------------------------------- resultbar */
 .resultbar {
   display: flex;
@@ -537,4 +590,166 @@ pre {
   .composer { max-height: none; }
   .history { margin: 12px; }
   .topbar { padding: 10px 12px; }
+}
+
+/* ------------------------------------------------------- model onboarding */
+/* Shown until every required weight component resolves. It sits between the
+   topbar and the layout so a fresh install cannot miss it. */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 12px 22px 0;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(251, 191, 36, .35);
+  background: linear-gradient(180deg, rgba(251, 191, 36, .09), rgba(251, 191, 36, .03));
+}
+.bannerbody { flex: 1 1 420px; min-width: 260px; }
+.bannerbody b { font-size: 13.5px; }
+.bannerbody p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+.bannerlist { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.bannerlist code {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(248, 113, 113, .1);
+  border: 1px solid rgba(248, 113, 113, .28);
+  color: #ffb4b4;
+}
+.banneractions { display: flex; gap: 8px; }
+
+/* ------------------------------------------------------------ mode picker */
+.modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.mode {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 12px;
+  text-align: left;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.mode:hover { border-color: rgba(139, 108, 255, .5); }
+.mode.active {
+  border-color: rgba(139, 108, 255, .8);
+  background: rgba(139, 108, 255, .14);
+  box-shadow: inset 0 0 0 1px rgba(139, 108, 255, .25);
+}
+.mode b { font-size: 13px; font-weight: 650; }
+.mode small { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.mode:disabled, .mode.blocked { opacity: .55; }
+
+/* ----------------------------------------------------- reference image grid */
+.refgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px;
+}
+.refcard {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.refcard img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.refcard .order {
+  position: absolute; top: 5px; left: 5px;
+  min-width: 18px; height: 18px;
+  display: grid; place-items: center;
+  padding: 0 4px;
+  border-radius: 6px;
+  font-size: 11px; font-weight: 700;
+  background: rgba(10, 12, 16, .78);
+  border: 1px solid rgba(139, 108, 255, .6);
+  color: #d6ccff;
+}
+.refcard .del {
+  position: absolute; top: 4px; right: 4px;
+  width: 20px; height: 20px;
+  display: grid; place-items: center;
+  border-radius: 6px;
+  border: 1px solid var(--line-2);
+  background: rgba(10, 12, 16, .8);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+.refcard .del:hover { color: var(--err); border-color: rgba(248, 113, 113, .5); }
+.refcontrols {
+  position: absolute; left: 4px; right: 4px; bottom: 4px;
+  display: flex; justify-content: space-between;
+  opacity: 0; transition: opacity .15s;
+}
+.refcard:hover .refcontrols { opacity: 1; }
+.refcontrols .mini {
+  width: 20px; height: 20px;
+  display: grid; place-items: center;
+  border-radius: 6px;
+  border: 1px solid var(--line-2);
+  background: rgba(10, 12, 16, .8);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.refcontrols .mini:disabled { opacity: .3; cursor: default; }
+.refadd {
+  aspect-ratio: 1 / 1;
+  display: grid; place-items: center; gap: 2px;
+  border-radius: 10px;
+  border: 1px dashed var(--line-2);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+.refadd b { font-size: 18px; font-weight: 400; line-height: 1; }
+.refadd:hover { border-color: rgba(34, 211, 238, .6); color: var(--accent-2); }
+
+/* ------------------------------------------------------- component listing */
+.components { display: flex; flex-direction: column; gap: 4px; }
+.component {
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  grid-template-areas: "mark name" ". path";
+  gap: 1px 6px;
+  font-size: 11.5px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+.component i { grid-area: mark; color: var(--ok); font-style: normal; }
+.component span { grid-area: name; color: var(--text); }
+.component code {
+  grid-area: path;
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.component.missing { border-color: rgba(248, 113, 113, .35); }
+.component.missing i { color: var(--err); }
+.component.missing code { color: #ffb4b4; }
+
+.switch.inline { font-size: 12px; }
+
+/* Advanced edition: component list relocated under the preview. */
+#stageExtra {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+@media (max-width: 640px) {
+  .modes { grid-template-columns: 1fr; }
+  .banner { margin: 10px 12px 0; }
 }

@@ -80,6 +80,14 @@ if not exist "%DIST%" mkdir "%DIST%"
 copy /Y "%ROOT%\build\bin\h3rt.dll" "%DIST%\" >nul
 copy /Y "%ROOT%\build\bin\h3rt.lib" "%DIST%\" >nul
 copy /Y "%ROOT%\build\bin\h3rt_smoke.exe" "%DIST%\" >nul
+rem The tokenizer is not part of the ComfyUI model download, but the engine
+rem cannot tokenize a prompt without it. Ship it next to the DLL: h3rt looks
+rem for <dll dir>\tokenizer\tokenizer.json before it gives up.
+if exist "%ROOT%\assets\tokenizer\tokenizer.json" (
+    if not exist "%DIST%\tokenizer" mkdir "%DIST%\tokenizer"
+    copy /Y "%ROOT%\assets\tokenizer\tokenizer.json" "%DIST%\tokenizer\" >nul
+    echo     tokenizer: %DIST%\tokenizer\tokenizer.json
+)
 if not exist "%DIST%\h3rt.dll" goto :fail
 
 echo OK. Native DLL: %DIST%\h3rt.dll

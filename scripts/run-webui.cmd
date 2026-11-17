@@ -1,12 +1,20 @@
 @echo off
 rem Starts the general edition (通用版) of the H3 WebUI.
+rem
+rem Model pack discovery order (see ModelLocator.cs):
+rem   1. --model-dir / H3:ModelDir
+rem   2. H3_MODEL_DIR environment variable
+rem   3. h3.config.json  "h3_dir"
+rem   4. %USERPROFILE%\h3-models\pdd8
+rem   5. <app>\models\pdd8, <app>\models
+rem So you normally do not need to set anything; only an explicit override is
+rem forwarded when H3_MODEL_DIR is defined.
+rem
 rem Any extra arguments are forwarded, e.g.  run-webui.cmd --port 8080
 setlocal EnableDelayedExpansion
 
 set "ROOT=%~dp0.."
 pushd "%ROOT%"
-
-if not defined H3_MODEL_DIR set "H3_MODEL_DIR=D:\AI\convert\minimax\h3-models\pdd8"
 
 set "APP=dotnet\src\H3NetRuntime.WebUI\bin\Release\net8.0\H3NetRuntime.WebUI.dll"
 if not exist "%APP%" (
@@ -15,8 +23,12 @@ if not exist "%APP%" (
     exit /b 1
 )
 
+set "MODEL_ARGS="
+if defined H3_MODEL_DIR set MODEL_ARGS=--model-dir "%H3_MODEL_DIR%"
+
 echo Starting H3 WebUI (通用版) -> http://127.0.0.1:7867/
-dotnet "%APP%" --edition general --model-dir "%H3_MODEL_DIR%" %*
+if defined H3_MODEL_DIR (echo   model pack: %H3_MODEL_DIR%) else (echo   model pack: ^(auto-detect^))
+dotnet "%APP%" --edition general %MODEL_ARGS% %*
 set "CODE=%ERRORLEVEL%"
 popd
 exit /b %CODE%

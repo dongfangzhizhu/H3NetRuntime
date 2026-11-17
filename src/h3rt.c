@@ -10,6 +10,7 @@
 #include "h3.h"
 #include "h3_config.h"
 #include "h3_host.h"
+#include "h3rt_links.h"
 #include "cJSON.h"
 
 #include <stdarg.h>
@@ -18,6 +19,9 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+
+#include <dirent.h>
+#include <sys/stat.h>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -31,6 +35,7 @@ __declspec(dllimport) int __stdcall CloseHandle(void *handle);
 #define H3RT_THREAD_RET unsigned __stdcall
 #define H3RT_THREAD_RETURN return 0
 #else
+#include <unistd.h> /* getpid() for unique temp output names */
 #define H3RT_THREAD_RET void *
 #define H3RT_THREAD_RETURN return NULL
 #endif
@@ -52,8 +57,10 @@ static __thread char h3rt_tls_error[H3RT_ERROR_CAPACITY];
 
 struct h3rt_handle {
     h3_ctx *ctx;
-    char model_dir[H3RT_PATH_CAPACITY];
+    char model_dir[H3RT_PATH_CAPACITY];   /* pack the caller asked for */
+    char pack_dir[H3RT_PATH_CAPACITY];    /* pack the engine actually reads */
     char text_cache_dir[H3RT_PATH_CAPACITY];
+    int composed;                         /* 1 when pack_dir is a link pack */
     int keep_dit;
     int cache_enabled;
     pthread_mutex_t api_mutex;    /* serialises generation and destruction */
@@ -158,16 +165,24 @@ static double h3rt_now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
+/* Bytes in a file.  ftell() returns a 32-bit long on Windows, which truncates
+ * a 15.8 GB checkpoint, so use the 64-bit variants there. */
 static double h3rt_file_size(const char *path) {
+#if defined(_WIN32)
     FILE *file = fopen(path, "rb");
     if (!file) return 0.0;
     double size = 0.0;
-    if (fseek(file, 0, SEEK_END) == 0) {
-        long position = ftell(file);
+    if (_fseeki64(file, 0, SEEK_END) == 0) {
+        long long position = _ftelli64(file);
         if (position > 0) size = (double)position;
     }
     fclose(file);
     return size;
+#else
+    struct stat info;
+    if (stat(path, &info) != 0 || info.st_size <= 0) return 0.0;
+    return (double)info.st_size;
+#endif
 }
 
 static char *h3rt_json_to_string(cJSON *value) {
@@ -197,6 +212,14 @@ static int h3rt_progress_bridge(const char *phase, int completed, int total,
             task->phases[task->phase_count].at_ms =
                 h3rt_now_ms() - task->started_ms;
             task->phase_count++;
+            /* One line per phase transition: a run takes minutes, and this is
+             * what makes "it is still in the text encoder" visible in a
+             * console without a callback. */
+            const char *quiet = getenv("H3RT_QUIET");
+            if (!quiet || !*quiet || !strcmp(quiet, "0"))
+                fprintf(stderr, "[h3rt] %6.1fs  %s (%d/%d)\n",
+                        (double)(h3rt_now_ms() - task->started_ms) / 1000.0,
+                        name, completed, total);
         }
     }
     if (task->user.on_progress) {
@@ -282,16 +305,6 @@ static int h3rt_run_worker(h3rt_generate_task *task) {
 }
 
 /* ------------------------------------------------------------ references */
-
-static int h3rt_reference_kind(const char *name, int fallback) {
-    if (!name || !*name) return fallback;
-    if (!strcmp(name, "image")) return H3_REFERENCE_IMAGE;
-    if (!strcmp(name, "video")) return H3_REFERENCE_VIDEO;
-    if (!strcmp(name, "audio")) return H3_REFERENCE_AUDIO;
-    if (!strcmp(name, "video_audio") || !strcmp(name, "video+audio"))
-        return H3_REFERENCE_VIDEO_AUDIO;
-    return fallback;
-}
 
 static int h3rt_add_reference(h3_reference *refs, size_t *count, size_t max,
                               const char *kind_name, int numeric_kind,
@@ -406,6 +419,737 @@ static int h3rt_collect_references(const cJSON *request, h3_reference *refs,
     return 1;
 }
 
+/* ------------------------------------------------------------ model paths */
+
+/* Every weight component the engine resolves under the pack root.  A caller
+ * that keeps its checkpoints in separate directories (the normal case after
+ * downloading a DiT, a text encoder and two VAEs from different releases)
+ * names them in options.models and h3rt links them into that layout.
+ *
+ * `accepts_parent` means the slot may also be given one level up: the video
+ * VAE is read from FL2VA/video_vae/source, but users naturally point at the
+ * FL2VA/video_vae directory that contains it. */
+typedef struct {
+    const char *key;         /* options.models key */
+    const char *slot;        /* path inside the pack root */
+    int is_directory;        /* 0 = a single file */
+    int accepts_parent;      /* the slot may be given one level up */
+    int required;            /* the engine cannot start without it */
+    const char *hint;        /* what to tell the user when it is missing */
+} h3rt_slot;
+
+static const h3rt_slot h3rt_slots[] = {
+    {"text_encoder", "FL2VA/text_encoder", 1, 0, 1, "text encoder directory"},
+    {"transformer", "FL2VA/transformer", 1, 0, 1, "FL2VA DiT directory"},
+    {"video_vae", "FL2VA/video_vae/source", 1, 1, 1, "video VAE weights"},
+    {"audio_vae", "FL2VA/audio_vae", 1, 0, 1, "audio VAE weights"},
+    {"tokenizer", "FL2VA/tokenizer", 1, 0, 1, "tokenizer files"},
+    {"pdd_lora", "FL2VA/pdd_lora.safetensors", 0, 0, 0, NULL},
+    {"ref2va_transformer", "Ref2VA/transformer", 1, 0, 0, NULL},
+    {"ref2va_text_encoder", "Ref2VA/text_encoder", 1, 0, 0, NULL},
+    {"ref2va_video_vae", "Ref2VA/video_vae/source", 1, 1, 0, NULL},
+    {"ref2va_audio_vae", "Ref2VA/audio_vae", 1, 0, 0, NULL},
+    {"ref2va_tokenizer", "Ref2VA/tokenizer", 1, 0, 0, NULL}
+};
+#define H3RT_SLOT_COUNT (sizeof(h3rt_slots) / sizeof(h3rt_slots[0]))
+
+typedef struct {
+    const char *target;                    /* resolved source, NULL when absent */
+    char storage[H3RT_PATH_CAPACITY];
+} h3rt_resolved_slot;
+
+static void h3rt_join_path(char *out, size_t size, const char *left,
+                           const char *right) {
+    if (!left || !*left) {
+        snprintf(out, size, "%s", right ? right : "");
+        return;
+    }
+    size_t length = strlen(left);
+    int needs_separator = left[length - 1] != '/' && left[length - 1] != '\\';
+    snprintf(out, size, "%s%s%s", left, needs_separator ? "/" : "",
+             right ? right : "");
+}
+
+static int h3rt_same_path(const char *left, const char *right) {
+    if (!left || !right) return 0;
+    size_t a = strlen(left), b = strlen(right);
+    while (a > 0 && (left[a - 1] == '/' || left[a - 1] == '\\')) a--;
+    while (b > 0 && (right[b - 1] == '/' || right[b - 1] == '\\')) b--;
+    if (a != b) return 0;
+    for (size_t i = 0; i < a; i++) {
+        char x = left[i] == '\\' ? '/' : left[i];
+        char y = right[i] == '\\' ? '/' : right[i];
+#if defined(_WIN32)
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+#endif
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+/* FNV-1a over the resolved layout: the link pack is content-addressed by the
+ * paths it was built from, so a second process (or a second run) reuses the
+ * same directory instead of accumulating one per start. */
+static unsigned long long h3rt_fnv1a(const char *text,
+                                     unsigned long long hash) {
+    const unsigned char *cursor = (const unsigned char *)text;
+    for (; cursor && *cursor; cursor++) {
+        hash ^= (unsigned long long)*cursor;
+        hash *= 1099511628211ull;
+    }
+    hash ^= 0x1full;
+    hash *= 1099511628211ull;
+    return hash;
+}
+
+/* Links every entry of `source_dir` that `target_dir` does not already have.
+ * Used when a component is given as a bare .safetensors: the weights come from
+ * the caller, the small sidecars (config.json, pdd_heads.safetensors) come from
+ * the pack root. */
+static int h3rt_fill_from_directory(const char *source_dir,
+                                    const char *target_dir, char *error,
+                                    size_t error_size) {
+    if (!h3rt_is_directory(source_dir)) return 1;
+    DIR *stream = opendir(source_dir);
+    if (!stream) return 1; /* nothing to copy is not a failure */
+    int ok = 1;
+    struct dirent *entry;
+    while (ok && (entry = readdir(stream))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        char source[H3RT_PATH_CAPACITY];
+        char target[H3RT_PATH_CAPACITY];
+        h3rt_join_path(source, sizeof(source), source_dir, entry->d_name);
+        h3rt_join_path(target, sizeof(target), target_dir, entry->d_name);
+        if (h3rt_path_exists(target)) continue;
+        if (!h3rt_link_path(target, source, h3rt_is_directory(source), error,
+                            error_size))
+            ok = 0;
+    }
+    closedir(stream);
+    return ok;
+}
+
+/* Case-insensitive "does text end with suffix", without strcasecmp (which the
+ * Win32 compatibility layer does not expose). */
+static int h3rt_ends_with_ci(const char *text, const char *suffix) {
+    size_t text_len = strlen(text);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len > text_len) return 0;
+    const char *tail = text + (text_len - suffix_len);
+    for (size_t i = 0; i < suffix_len; i++) {
+        char a = tail[i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static void h3rt_parent_dir(char *out, size_t size, const char *path) {
+    snprintf(out, size, "%s", path);
+    char *cut = strrchr(out, '/');
+#if defined(_WIN32)
+    char *backslash = strrchr(out, '\\');
+    if (backslash && (!cut || backslash > cut)) cut = backslash;
+#endif
+    if (cut) *cut = '\0';
+}
+
+/* Copies the small metadata files that sit next to a bare weight file into the
+ * slot, so pointing "models" at one downloaded .safetensors is enough: the
+ * transformer slot needs config.json and may want pdd_heads.safetensors, and
+ * both normally live in the same directory as the weights.  Big shards are
+ * never pulled in, only the names the engine actually reads. */
+static int h3rt_link_sidecars(const char *source_dir, const char *target_dir,
+                              char *error, size_t error_size) {
+    if (!h3rt_is_directory(source_dir)) return 1;
+    DIR *stream = opendir(source_dir);
+    if (!stream) return 1;
+    int ok = 1;
+    struct dirent *entry;
+    while (ok && (entry = readdir(stream))) {
+        const char *name = entry->d_name;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        if (!h3rt_ends_with_ci(name, ".json") &&
+            !h3rt_ends_with_ci(name, "pdd_heads.safetensors"))
+            continue;
+        char source[H3RT_PATH_CAPACITY];
+        char target[H3RT_PATH_CAPACITY];
+        h3rt_join_path(source, sizeof(source), source_dir, name);
+        h3rt_join_path(target, sizeof(target), target_dir, name);
+        if (h3rt_path_exists(target)) continue;
+        if (h3rt_is_directory(source)) continue;
+        if (!h3rt_link_path(target, source, 0, error, error_size)) ok = 0;
+    }
+    closedir(stream);
+    return ok;
+}
+
+/* Human-readable component report for the console.
+ *
+ * Every "why is it loading the wrong thing" question starts with the resolved
+ * paths, and they are only knowable inside the engine: the pack root, the link
+ * pack the composer produced, and which slot each weight actually came from.
+ * Printed unconditionally (stderr, so a JSON stdout stays clean); H3RT_QUIET=1
+ * silences it. */
+static void h3rt_report_paths(const char *model_dir, const char *pack_dir,
+                              int composed) {
+    const char *quiet = getenv("H3RT_QUIET");
+    if (quiet && *quiet && strcmp(quiet, "0") != 0) return;
+    fprintf(stderr, "[h3rt] model_dir : %s\n",
+            model_dir && *model_dir ? model_dir : "(none)");
+    fprintf(stderr, "[h3rt] pack_dir  : %s%s\n", pack_dir,
+            composed ? "  (composed link pack)" : "");
+    for (size_t i = 0; i < H3RT_SLOT_COUNT; i++) {
+        char path[H3RT_PATH_CAPACITY];
+        h3rt_join_path(path, sizeof(path), pack_dir, h3rt_slots[i].slot);
+        if (!h3rt_path_exists(path)) {
+            if (h3rt_slots[i].required)
+                fprintf(stderr, "[h3rt]   %-20s MISSING  %s\n",
+                        h3rt_slots[i].key, path);
+            continue;
+        }
+        if (h3rt_is_directory(path)) {
+            unsigned files = 0;
+            unsigned long long bytes = 0;
+            DIR *stream = opendir(path);
+            if (stream) {
+                struct dirent *entry;
+                while ((entry = readdir(stream))) {
+                    if (!strcmp(entry->d_name, ".") ||
+                        !strcmp(entry->d_name, ".."))
+                        continue;
+                    char child[H3RT_PATH_CAPACITY];
+                    h3rt_join_path(child, sizeof(child), path, entry->d_name);
+                    if (h3rt_is_directory(child)) continue;
+                    files++;
+                    bytes += (unsigned long long)h3rt_file_size(child);
+                }
+                closedir(stream);
+            }
+            fprintf(stderr, "[h3rt]   %-20s %s  (%u file%s, %.2f GB)\n",
+                    h3rt_slots[i].key, path, files, files == 1 ? "" : "s",
+                    (double)bytes / 1073741824.0);
+        } else {
+            fprintf(stderr, "[h3rt]   %-20s %s  (%.2f GB)\n",
+                    h3rt_slots[i].key, path,
+                    (double)h3rt_file_size(path) / 1073741824.0);
+        }
+    }
+    fflush(stderr);
+}
+
+/* ------------------------------------------------------------ tokenizer */
+
+/* The tokenizer JSON is the one input the ComfyUI model download does not
+ * ship: CLIPLoaderGGUF fetches it from the HuggingFace repo, while the engine
+ * needs the file on disk.  A user who only has the five released weight files
+ * therefore still needs this 7 MiB text file, and making them hunt for it is
+ * the single most common "it will not start" report.  So: look for it in every
+ * place it can reasonably be, including next to the native library, where the
+ * packaging step drops a copy.
+ *
+ * Returns 1 and fills `out` with the directory holding tokenizer.json. */
+static int h3rt_tokenizer_in(const char *dir, char *out, size_t size) {
+    if (!dir || !*dir) return 0;
+    char probe[H3RT_PATH_CAPACITY];
+    h3rt_join_path(probe, sizeof(probe), dir, "tokenizer.json");
+    if (!h3rt_path_exists(probe)) return 0;
+    snprintf(out, size, "%s", dir);
+    return 1;
+}
+
+/* Directory holding the h3rt shared library itself.  A tokenizer shipped next
+ * to it (runtimes/<rid>/native/tokenizer/) is found with no configuration.
+ *
+ * `which`: 0 = this library, 1 = the host executable.  The address of a
+ * function inside the library is not a valid HMODULE, so the module handle has
+ * to come from GetModuleHandleExA(FROM_ADDRESS). */
+static int h3rt_binary_dir(int which, char *out, size_t size) {
+#if defined(_WIN32)
+    __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(
+        void *module, char *name, unsigned long count);
+    __declspec(dllimport) int __stdcall GetModuleHandleExA(
+        unsigned long flags, const void *name, void **module);
+    void *module = NULL;
+    if (which == 0) {
+        /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | _UNCHANGED_REFCOUNT */
+        if (!GetModuleHandleExA(0x00000004ul | 0x00000002ul,
+                                (const void *)&h3rt_binary_dir, &module))
+            return 0;
+    }
+    char buffer[H3RT_PATH_CAPACITY];
+    unsigned long length = GetModuleFileNameA(module, buffer,
+                                             (unsigned long)sizeof(buffer));
+    if (length == 0 || length >= sizeof(buffer)) return 0;
+    while (length > 0) {
+        char c = buffer[length - 1];
+        if (c == '/' || c == '\\') {
+            buffer[length - 1] = '\0';
+            break;
+        }
+        length--;
+    }
+    if (!buffer[0]) return 0;
+    snprintf(out, size, "%s", buffer);
+    return 1;
+#else
+    /* /proc/self/maps lines look like
+     *   7f2b4c000000-7f2b4c021000 r-xp 00000000 fd:01 1234567 /path/libh3rt.so
+     * The path is the sixth whitespace-separated field. */
+    const char *want = which == 0 ? "libh3rt.so" : NULL;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[4096];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), maps)) {
+        char *scan = line;
+        int field = 0;
+        while (field < 5 && *scan) {
+            while (*scan == ' ' || *scan == '\t') scan++;
+            while (*scan && *scan != ' ' && *scan != '\t') scan++;
+            field++;
+        }
+        while (*scan == ' ' || *scan == '\t') scan++;
+        char *path = *scan ? scan : NULL;
+        if (!path) continue;
+        char *newline = strchr(path, '\n');
+        if (newline) *newline = '\0';
+        size_t length = strlen(path);
+        if (!want) {
+            /* The host executable is /proc/self/exe; handled below. */
+            break;
+        }
+        if (length < strlen(want)) continue;
+        if (strcmp(path + length - strlen(want), want) != 0) continue;
+        char *slash = strrchr(path, '/');
+        if (!slash) continue;
+        *slash = '\0';
+        snprintf(out, size, "%s", path);
+        found = 1;
+    }
+    fclose(maps);
+    if (found) return 1;
+    if (which == 1) {
+        char target[H3RT_PATH_CAPACITY];
+        ssize_t length = readlink("/proc/self/exe", target,
+                                  sizeof(target) - 1);
+        if (length <= 0) return 0;
+        target[length] = '\0';
+        char *slash = strrchr(target, '/');
+        if (!slash) return 0;
+        *slash = '\0';
+        snprintf(out, size, "%s", target);
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+/* Search chain for tokenizer.json.  `report` (optional) receives a one-line
+ * summary of what was tried, which is what the create error quotes. */
+static int h3rt_find_tokenizer(const char *model_dir, char *out, size_t size,
+                               char *report, size_t report_size) {
+    if (report && report_size) report[0] = '\0';
+    char candidate[H3RT_PATH_CAPACITY];
+
+    /* 1. Explicit override: H3RT_TOKENIZER_DIR, either the directory itself or
+     *    a path straight to tokenizer.json. */
+    const char *env = getenv("H3RT_TOKENIZER_DIR");
+    if (env && *env) {
+        snprintf(candidate, sizeof(candidate), "%s", env);
+        if (h3rt_ends_with_ci(candidate, "tokenizer.json")) {
+            char parent[H3RT_PATH_CAPACITY];
+            snprintf(parent, sizeof(parent), "%s", candidate);
+            char *cut = strrchr(parent, '/');
+            char *cut_win = strrchr(parent, '\\');
+            if (cut_win && (!cut || cut_win > cut)) cut = cut_win;
+            if (cut) {
+                *cut = '\0';
+                if (h3rt_tokenizer_in(parent, out, size)) return 1;
+            }
+        } else if (h3rt_tokenizer_in(candidate, out, size)) {
+            return 1;
+        }
+        if (report && report_size)
+            snprintf(report, report_size, "H3RT_TOKENIZER_DIR=%s has no "
+                     "tokenizer.json; ", env);
+    }
+
+    /* 2. Layouts a user actually points at. */
+    static const char *const relatives[] = {
+        "tokenizer",                  /* ComfyUI models/tokenizer, or a pack root */
+        "text_encoders/tokenizer",    /* ComfyUI-GGUF convention */
+        "FL2VA/tokenizer",            /* an existing H3 pack */
+        "../tokenizer"                /* next to the pack root */
+    };
+    for (size_t index = 0; index < sizeof(relatives) / sizeof(relatives[0]);
+         index++) {
+        if (!model_dir || !*model_dir) break;
+        h3rt_join_path(candidate, sizeof(candidate), model_dir,
+                       relatives[index]);
+        if (h3rt_tokenizer_in(candidate, out, size)) return 1;
+    }
+
+    /* 3. Shipped next to the native library (runtimes/<rid>/native/tokenizer,
+     *    dist/win-x64/tokenizer, ...), or next to the host executable, which
+     *    is the same folder in a normal package layout. */
+    char module[H3RT_PATH_CAPACITY] = "";
+    for (int which = 0; which < 2; which++) {
+        char root[H3RT_PATH_CAPACITY];
+        if (!h3rt_binary_dir(which, root, sizeof(root))) continue;
+        if (which == 0) snprintf(module, sizeof(module), "%s", root);
+        static const char *const near_binary[] = {
+            "tokenizer",
+            "../tokenizer",
+            "../../tokenizer",
+            "../../../tokenizer",
+            "../../../../tokenizer",
+            "../share/h3rt/tokenizer"
+        };
+        for (size_t index = 0;
+             index < sizeof(near_binary) / sizeof(near_binary[0]); index++) {
+            h3rt_join_path(candidate, sizeof(candidate), root,
+                           near_binary[index]);
+            if (h3rt_tokenizer_in(candidate, out, size)) return 1;
+        }
+    }
+
+    /* 4. The engine's own default model root, which is where a pre-existing
+     *    H3 install keeps the tokenizer. */
+    char home[H3RT_PATH_CAPACITY];
+    if (h3_config_expand_home("~/h3-models/pdd8/FL2VA/tokenizer", home,
+                              sizeof(home)) &&
+        h3rt_tokenizer_in(home, out, size))
+        return 1;
+
+    if (report && report_size) {
+        size_t used = strlen(report);
+        snprintf(report + used, report_size - used,
+                 "looked for tokenizer.json in <%s>/{tokenizer,"
+                 "text_encoders/tokenizer,FL2VA/tokenizer}, next to %s, and in "
+                 "~/h3-models/pdd8/FL2VA/tokenizer; set H3RT_TOKENIZER_DIR or "
+                 "models.tokenizer to override",
+                 model_dir && *model_dir ? model_dir : "model_dir",
+                 module[0] ? module : "the native library");
+    }
+    return 0;
+}
+
+/* --------------------------------------------------- ComfyUI model layout */
+
+/* ComfyUI's `models/` directory: diffusion_models/, text_encoders/, vae/.
+ * That is where the five released files of ComfyUI_MiniMax-H3-V8 live, and it
+ * is what a user points --model-dir at. */
+static int h3rt_is_comfy_layout(const char *dir) {
+    static const char *const parts[] = {"diffusion_models", "text_encoders", "vae"};
+    for (size_t index = 0; index < sizeof(parts) / sizeof(parts[0]); index++) {
+        char probe[H3RT_PATH_CAPACITY];
+        h3rt_join_path(probe, sizeof(probe), dir, parts[index]);
+        if (!h3rt_is_directory(probe)) return 0;
+    }
+    return 1;
+}
+
+/* First file in `dir` whose lower-cased name contains every needle and ends
+ * with `extension` (pass "" for any). */
+static int h3rt_pick_file(const char *dir, const char *const *needles,
+                          int needle_count, const char *extension,
+                          char *out, size_t size) {
+    DIR *stream = opendir(dir);
+    if (!stream) return 0;
+    char best[H3RT_PATH_CAPACITY];
+    best[0] = '\0';
+    struct dirent *entry;
+    while ((entry = readdir(stream))) {
+        if (entry->d_name[0] == '.') continue;
+        if (extension && *extension &&
+            !h3rt_ends_with_ci(entry->d_name, extension))
+            continue;
+        int matches = 1;
+        for (int needle = 0; needle < needle_count; needle++) {
+            /* Case-insensitive substring test, without strcasestr. */
+            size_t need = strlen(needles[needle]);
+            size_t have = strlen(entry->d_name);
+            int found = 0;
+            for (size_t at = 0; at + need <= have && !found; at++) {
+                size_t step = 0;
+                while (step < need) {
+                    char a = entry->d_name[at + step];
+                    char b = needles[needle][step];
+                    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+                    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+                    if (a != b) break;
+                    step++;
+                }
+                if (step == need) found = 1;
+            }
+            if (!found) { matches = 0; break; }
+        }
+        if (!matches) continue;
+        char candidate[H3RT_PATH_CAPACITY];
+        h3rt_join_path(candidate, sizeof(candidate), dir, entry->d_name);
+        if (!h3rt_is_directory(candidate)) {
+            snprintf(best, sizeof(best), "%s", candidate);
+            break;
+        }
+    }
+    closedir(stream);
+    if (!best[0]) return 0;
+    snprintf(out, size, "%s", best);
+    return 1;
+}
+
+/* Fills `models` with what the ComfyUI layout holds.  Missing optional pieces
+ * are simply not added, so the composer reports exactly what is absent. */
+static void h3rt_derive_comfy_models(const char *dir, cJSON *models) {
+    char path[H3RT_PATH_CAPACITY];
+    char diffusion[H3RT_PATH_CAPACITY];
+    char encoders[H3RT_PATH_CAPACITY];
+    char vae[H3RT_PATH_CAPACITY];
+    h3rt_join_path(diffusion, sizeof(diffusion), dir, "diffusion_models");
+    h3rt_join_path(encoders, sizeof(encoders), dir, "text_encoders");
+    h3rt_join_path(vae, sizeof(vae), dir, "vae");
+
+    static const char *const fl2va[] = {"fl2va"};
+    static const char *const ref2va[] = {"ref2va"};
+    static const char *const sol_vae[] = {"sol_vae"};
+    static const char *const video_vae[] = {"video_vae"};
+    static const char *const audio_vae[] = {"audio_vae"};
+    static const char *const gguf[] = {"gguf"};
+    static const char *const qwen[] = {"qwen"};
+
+    if (h3rt_pick_file(diffusion, fl2va, 1, ".safetensors", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "transformer", path);
+    if (h3rt_pick_file(diffusion, ref2va, 1, ".safetensors", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "ref2va_transformer", path);
+    if (h3rt_pick_file(encoders, qwen, 1, ".gguf", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "text_encoder", path);
+    else if (h3rt_pick_file(encoders, gguf, 0, ".gguf", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "text_encoder", path);
+    else if (h3rt_pick_file(encoders, gguf, 0, ".safetensors", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "text_encoder", path);
+    if (h3rt_pick_file(vae, sol_vae, 1, ".safetensors", path, sizeof(path)) ||
+        h3rt_pick_file(vae, video_vae, 1, ".safetensors", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "video_vae", path);
+    if (h3rt_pick_file(vae, audio_vae, 1, ".safetensors", path, sizeof(path)))
+        cJSON_AddStringToObject(models, "audio_vae", path);
+    /* The tokenizer is not part of the ComfyUI model download; search the
+     * usual places (including next to the native library) instead of failing
+     * with "models.tokenizer is required". */
+    char tokenizer[H3RT_PATH_CAPACITY];
+    if (h3rt_find_tokenizer(dir, tokenizer, sizeof(tokenizer), NULL, 0))
+        cJSON_AddStringToObject(models, "tokenizer", tokenizer);
+}
+
+/* Builds `<pack>/FL2VA/...` out of the per-component paths in `models`.
+ *
+ * Returns 1 when `out_pack` holds a freshly resolved link pack, 0 when the
+ * base directory already has the requested layout (nothing to do), and -1 with
+ * a message in `error` when a component is missing or cannot be linked. */
+static int h3rt_compose_pack(const char *base, const cJSON *models,
+                             const char *cache_dir, char *out_pack,
+                             size_t out_pack_size, char *error,
+                             size_t error_size) {
+    h3rt_resolved_slot *slots = (h3rt_resolved_slot *)calloc(
+        H3RT_SLOT_COUNT, sizeof(*slots));
+    if (!slots) {
+        snprintf(error, error_size, "out of memory resolving model paths");
+        return -1;
+    }
+
+    int override = 0;
+    int status = 1;
+    unsigned long long hash = 1469598103934665603ull;
+    hash = h3rt_fnv1a(base ? base : "", hash);
+
+    for (size_t i = 0; i < H3RT_SLOT_COUNT; i++) {
+        const char *given = h3rt_str(models, h3rt_slots[i].key, NULL);
+        char standard[H3RT_PATH_CAPACITY];
+        standard[0] = '\0';
+        if (base && *base) h3rt_join_path(standard, sizeof(standard), base,
+                                          h3rt_slots[i].slot);
+
+        if (given && *given) {
+            snprintf(slots[i].storage, sizeof(slots[i].storage), "%s", given);
+            /* Without a pack root there is no standard layout to match, so the
+             * link pack is the only way the engine can see these components. */
+            if (!standard[0] || !h3rt_same_path(given, standard)) override = 1;
+        } else if (standard[0]) {
+            snprintf(slots[i].storage, sizeof(slots[i].storage), "%s", standard);
+        } else {
+            continue;
+        }
+
+        if (!h3rt_path_exists(slots[i].storage)) {
+            if (given && *given) {
+                snprintf(error, error_size,
+                         "models.%s points at '%s', which does not exist",
+                         h3rt_slots[i].key, slots[i].storage);
+                status = -1;
+                break;
+            }
+            continue; /* the base pack simply does not have this slot */
+        }
+        slots[i].target = slots[i].storage;
+        hash = h3rt_fnv1a(slots[i].storage, hash);
+    }
+
+    if (status == 1 && !override) {
+        /* Every component is already where the engine expects it. */
+        free(slots);
+        return 0;
+    }
+
+    for (size_t i = 0; status == 1 && i < H3RT_SLOT_COUNT; i++) {
+        if (!slots[i].target && h3rt_slots[i].required) {
+            snprintf(error, error_size,
+                     "models.%s is required: point it at the %s, or set "
+                     "model_dir to a pack that already has FL2VA/%s",
+                     h3rt_slots[i].key, h3rt_slots[i].hint,
+                     strchr(h3rt_slots[i].slot, '/') + 1);
+            status = -1;
+        }
+    }
+
+    char pack[H3RT_PATH_CAPACITY];
+    if (status == 1) {
+        int written = snprintf(pack, sizeof(pack), "%s/h3rt-pack-%016llx",
+                               cache_dir, hash);
+        if (written < 0 || (size_t)written >= sizeof(pack)) {
+            snprintf(error, error_size,
+                     "pack_cache_dir is too long (%zu bytes); use a shorter "
+                     "directory", strlen(cache_dir));
+            status = -1;
+        } else if (!h3rt_make_dirs(pack)) {
+            snprintf(error, error_size,
+                     "cannot create the link pack '%s'; set pack_cache_dir to "
+                     "a writable directory", pack);
+            status = -1;
+        }
+    }
+
+    for (size_t i = 0; status == 1 && i < H3RT_SLOT_COUNT; i++) {
+        if (!slots[i].target) continue;
+        char link[H3RT_PATH_CAPACITY];
+        const char *slot = h3rt_slots[i].slot;
+        int is_directory = h3rt_slots[i].is_directory;
+
+        /* A component given as a single weight file: the slot becomes a
+         * directory holding that file as model.safetensors (or model.gguf, for
+         * the Q4_K_M text encoder), plus the metadata files that live next to
+         * it (config.json, pdd_heads.safetensors) and whatever the pack root
+         * already had for the same slot. */
+        if (is_directory && !h3rt_is_directory(slots[i].target)) {
+            int is_gguf = h3rt_ends_with_ci(slots[i].target, ".gguf");
+            h3rt_join_path(link, sizeof(link), pack, slot);
+            if (!h3rt_make_dirs(link)) {
+                snprintf(error, error_size, "cannot create the '%s' slot",
+                         slot);
+                status = -1;
+                break;
+            }
+            char weight[H3RT_PATH_CAPACITY];
+            h3rt_join_path(weight, sizeof(weight), link,
+                           is_gguf ? "model.gguf" : "model.safetensors");
+            if (!h3rt_path_exists(weight) &&
+                !h3rt_link_path(weight, slots[i].target, 0, error,
+                                error_size)) {
+                status = -1;
+                break;
+            }
+            /* A GGUF carries everything in one file; pulling the pack root's
+             * safetensors in as well would make the reader prefer that. */
+            if (is_gguf) continue;
+            char weight_dir[H3RT_PATH_CAPACITY];
+            h3rt_parent_dir(weight_dir, sizeof(weight_dir), slots[i].target);
+            if (!h3rt_link_sidecars(weight_dir, link, error, error_size)) {
+                status = -1;
+                break;
+            }
+            if (base && *base) {
+                char base_slot[H3RT_PATH_CAPACITY];
+                h3rt_join_path(base_slot, sizeof(base_slot), base, slot);
+                if (!h3rt_fill_from_directory(base_slot, link, error,
+                                              error_size))
+                    status = -1;
+            }
+            /* The loader treats transformer/config.json as a presence marker,
+             * but the ComfyUI diffusion model is a bare .safetensors. Write a
+             * minimal one so that download works without a hand-made pack. */
+            if (status == 1 && strstr(slot, "transformer")) {
+                char config[H3RT_PATH_CAPACITY];
+                h3rt_join_path(config, sizeof(config), link, "config.json");
+                if (!h3rt_path_exists(config)) {
+                    FILE *file = fopen(config, "wb");
+                    if (file) {
+                        fputs("{\n  \"architectures\": [\"MiniMaxH3FL2VA\"],\n"
+                              "  \"model_type\": \"minimax_h3_fl2va\"\n}\n",
+                              file);
+                        fclose(file);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (h3rt_slots[i].accepts_parent && is_directory) {
+            char nested[H3RT_PATH_CAPACITY];
+            h3rt_join_path(nested, sizeof(nested), slots[i].target, "source");
+            if (h3rt_is_directory(nested)) {
+                /* Given FL2VA/video_vae, link that whole directory. */
+                char trimmed[H3RT_PATH_CAPACITY];
+                snprintf(trimmed, sizeof(trimmed), "%s", slot);
+                char *cut = strrchr(trimmed, '/');
+                if (cut) *cut = '\0';
+                slot = trimmed;
+            }
+        }
+        h3rt_join_path(link, sizeof(link), pack, slot);
+        if (h3rt_path_exists(link)) continue; /* same hash, same target */
+        if (!h3rt_link_path(link, slots[i].target, is_directory, error,
+                            error_size)) {
+            status = -1;
+            break;
+        }
+    }
+
+    if (status == 1) {
+        /* A manifest turns "why is it looking in AppData" into one file to
+         * open; the engine never reads it. */
+        cJSON *manifest = cJSON_CreateObject();
+        if (manifest) {
+            cJSON_AddStringToObject(manifest, "pack", pack);
+            cJSON_AddStringToObject(manifest, "base", base ? base : "");
+            cJSON *entries = cJSON_AddObjectToObject(manifest, "slots");
+            for (size_t i = 0; entries && i < H3RT_SLOT_COUNT; i++) {
+                if (slots[i].target)
+                    cJSON_AddStringToObject(entries, h3rt_slots[i].key,
+                                            slots[i].target);
+            }
+            char *text = cJSON_Print(manifest);
+            cJSON_Delete(manifest);
+            if (text) {
+                char manifest_path[H3RT_PATH_CAPACITY];
+                h3rt_join_path(manifest_path, sizeof(manifest_path), pack,
+                               "h3rt-pack.json");
+                FILE *file = fopen(manifest_path, "wb");
+                if (file) {
+                    fputs(text, file);
+                    fclose(file);
+                }
+                free(text);
+            }
+        }
+        snprintf(out_pack, out_pack_size, "%s", pack);
+    }
+
+    free(slots);
+    return status;
+}
+
 /* --------------------------------------------------------------- public */
 
 const char *h3rt_version(void) { return H3RT_VERSION; }
@@ -452,6 +1196,7 @@ char *h3rt_build_info(void) {
     cJSON_AddBoolToObject(json, "comfyui_required", 0);
     cJSON_AddStringToObject(json, "callbacks", "progress, decoded RGB frames");
     cJSON_AddStringToObject(json, "external_tools", "ffmpeg (mpeg muxing)");
+    cJSON_AddBoolToObject(json, "per_component_model_paths", 1);
     return h3rt_json_to_string(json);
 }
 
@@ -503,31 +1248,144 @@ int h3rt_create(const char *options_json, h3rt_handle **out_handle,
         }
     }
 
+    const cJSON *models = h3rt_item(options, "models");
+    int has_models = models && cJSON_IsObject(models) &&
+                     cJSON_GetArraySize(models) > 0;
+
     const char *model_dir = h3rt_str(options, "model_dir", NULL);
     if (!model_dir || !*model_dir) model_dir = h3rt_str(options, "h3_dir", NULL);
     char resolved[H3RT_PATH_CAPACITY];
+    resolved[0] = '\0';
+    /* With per-component paths the pack root is optional: everything the
+     * engine needs may come from options.models. */
     const char *source = model_dir && *model_dir ? model_dir :
                          config.h3_dir[0] ? config.h3_dir :
+                         has_models ? NULL :
                          "~/h3-models/pdd8";
-    if (source[0] == '~') {
-        char expanded[H3RT_PATH_CAPACITY];
-        if (h3_config_expand_home(source, expanded, sizeof(expanded))) {
-            snprintf(resolved, sizeof(resolved), "%s", expanded);
+    if (source) {
+        if (source[0] == '~') {
+            char expanded[H3RT_PATH_CAPACITY];
+            if (h3_config_expand_home(source, expanded, sizeof(expanded))) {
+                snprintf(resolved, sizeof(resolved), "%s", expanded);
+            } else {
+                snprintf(resolved, sizeof(resolved), "%s", source);
+            }
         } else {
             snprintf(resolved, sizeof(resolved), "%s", source);
         }
-    } else {
-        snprintf(resolved, sizeof(resolved), "%s", source);
     }
     snprintf(handle->model_dir, sizeof(handle->model_dir), "%s", resolved);
 
-    h3_ctx *ctx = h3_load_dir(handle->model_dir);
+    /* Pointed at a ComfyUI models/ directory: derive the five components from
+     * its subdirectories instead of asking the user to list them. */
+    if (!has_models && options && resolved[0] && h3rt_is_comfy_layout(resolved)) {
+        cJSON *derived = cJSON_CreateObject();
+        if (derived) {
+            h3rt_derive_comfy_models(resolved, derived);
+            if (cJSON_GetArraySize(derived) > 0) {
+                cJSON_AddItemToObject(options, "models", derived);
+                models = cJSON_GetObjectItemCaseSensitive(options, "models");
+                has_models = 1;
+                fprintf(stderr, "[h3rt] ComfyUI 模型目录：%s\n", resolved);
+            } else {
+                cJSON_Delete(derived);
+            }
+        }
+    }
+
+    /* A caller that listed the weights itself usually omits the tokenizer: it
+     * is not a weight file.  Fill it in from the search chain so the composer
+     * never reports a missing component that the runtime could find alone. */
+    if (has_models && !h3rt_str(models, "tokenizer", NULL)) {
+        char tokenizer[H3RT_PATH_CAPACITY];
+        char searched[512];
+        if (h3rt_find_tokenizer(resolved, tokenizer, sizeof(tokenizer), searched,
+                                sizeof(searched))) {
+            cJSON_AddStringToObject((cJSON *)models, "tokenizer", tokenizer);
+        } else {
+            const char *quiet = getenv("H3RT_QUIET");
+            if (!quiet || !*quiet || strcmp(quiet, "0") == 0)
+                fprintf(stderr, "[h3rt] tokenizer: %s\n", searched);
+        }
+    }
+
+    char pack_dir[H3RT_PATH_CAPACITY];
+    snprintf(pack_dir, sizeof(pack_dir), "%s", resolved);
+    if (has_models) {
+        const char *cache_option = h3rt_str(options, "pack_cache_dir", NULL);
+        char cache_dir[H3RT_PATH_CAPACITY];
+        if (cache_option && *cache_option) {
+            if (cache_option[0] == '~') {
+                char expanded[H3RT_PATH_CAPACITY];
+                if (h3_config_expand_home(cache_option, expanded,
+                                          sizeof(expanded)))
+                    snprintf(cache_dir, sizeof(cache_dir), "%s", expanded);
+                else
+                    snprintf(cache_dir, sizeof(cache_dir), "%s", cache_option);
+            } else {
+                snprintf(cache_dir, sizeof(cache_dir), "%s", cache_option);
+            }
+        } else {
+            /* Prefer a cache on the same volume as the weights: a hard link
+             * cannot cross volumes, and falling back to a copy of a 20 GB DiT
+             * is not an acceptable surprise.  A read-only model share cannot
+             * hold the cache, so fall back to the temp directory. */
+            int placed = 0;
+            if (resolved[0]) {
+                snprintf(cache_dir, sizeof(cache_dir), "%s/.h3rt-packs",
+                         resolved);
+                placed = h3rt_make_dirs(cache_dir);
+            }
+            if (!placed)
+                snprintf(cache_dir, sizeof(cache_dir), "%s/h3rt-packs",
+                         h3_temp_dir());
+        }
+        char compose_error[H3RT_ERROR_CAPACITY] = "";
+        int composed = h3rt_compose_pack(resolved, models, cache_dir, pack_dir,
+                                         sizeof(pack_dir), compose_error,
+                                         sizeof(compose_error));
+        if (composed < 0) {
+            h3rt_write_create_error(error, error_size, "cannot resolve the "
+                                    "model components: %s", compose_error);
+            cJSON_Delete(options);
+            pthread_mutex_destroy(&handle->api_mutex);
+            pthread_mutex_destroy(&handle->error_mutex);
+            free(handle);
+            return H3RT_ERR_MODEL;
+        }
+        handle->composed = composed;
+    }
+    if (!pack_dir[0]) {
+        h3rt_write_create_error(error, error_size,
+                                "no model_dir and no models.* paths given");
+        cJSON_Delete(options);
+        pthread_mutex_destroy(&handle->api_mutex);
+        pthread_mutex_destroy(&handle->error_mutex);
+        free(handle);
+        return H3RT_ERR_MODEL;
+    }
+    snprintf(handle->pack_dir, sizeof(handle->pack_dir), "%s", pack_dir);
+    h3rt_report_paths(handle->model_dir, handle->pack_dir, handle->composed);
+
+    h3_ctx *ctx = h3_load_dir(handle->pack_dir);
     if (!ctx) {
         const char *message = h3_last_error(NULL);
-        h3rt_write_create_error(error, error_size,
-                                "cannot load model pack '%s': %s", resolved,
-                                message && *message ? message :
-                                "FL2VA/transformer/config.json not found");
+        if (handle->composed) {
+            h3rt_write_create_error(
+                error, error_size,
+                "cannot load the model from the composed pack '%s': %s "
+                "(the link manifest is %s/h3rt-pack.json)",
+                handle->pack_dir,
+                message && *message ? message : "FL2VA/transformer/config.json "
+                                                "not found",
+                handle->pack_dir);
+        } else {
+            h3rt_write_create_error(error, error_size,
+                                    "cannot load model pack '%s': %s",
+                                    handle->pack_dir,
+                                    message && *message ? message :
+                                    "FL2VA/transformer/config.json not found");
+        }
         cJSON_Delete(options);
         pthread_mutex_destroy(&handle->api_mutex);
         pthread_mutex_destroy(&handle->error_mutex);
@@ -593,6 +1451,8 @@ char *h3rt_device_info(h3rt_handle *handle) {
     cJSON_AddBoolToObject(json, "unified_memory", device->unified_memory);
     cJSON_AddBoolToObject(json, "metal4_or_blackwell", device->metal4);
     cJSON_AddStringToObject(json, "model_dir", handle->model_dir);
+    cJSON_AddStringToObject(json, "pack_dir", handle->pack_dir);
+    cJSON_AddBoolToObject(json, "composed_pack", handle->composed != 0);
     return h3rt_json_to_string(json);
 }
 
@@ -618,6 +1478,8 @@ char *h3rt_model_info(h3rt_handle *handle) {
         cJSON_AddItemToObject(json, names[i], part);
     }
     cJSON_AddStringToObject(json, "model_dir", handle->model_dir);
+    cJSON_AddStringToObject(json, "pack_dir", handle->pack_dir);
+    cJSON_AddBoolToObject(json, "composed_pack", handle->composed != 0);
     cJSON_AddBoolToObject(json, "ref2va_available",
                           model->ref2va_transformer.files > 0);
     return h3rt_json_to_string(json);

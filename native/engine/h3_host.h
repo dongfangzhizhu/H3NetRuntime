@@ -120,6 +120,10 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+/* HyperFlow Flash's own 4/6/8-step interval grid (video shift 12, audio 3).
+ * A checkpoint that carries hyperflow_sigmas must use this instead of the
+ * uniform grid: its distilled weights were trained on these exact knots. */
+int h3_hyperflow_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* PDD's 8-step schedule (shift 12 video, 3 audio), fixed at
  * H3_PDD_NUM_STEPS / H3_PDD_BLOCK_SIZE steps. */
 int h3_pdd_schedule_build(h3_sigma_schedule *schedule);

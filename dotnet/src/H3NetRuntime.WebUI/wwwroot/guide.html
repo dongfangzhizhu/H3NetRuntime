@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>模型权重下载与安装 · MiniMax-H3 Flash</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#2a3240;
+    --text:#e6edf3; --muted:#9aa7b4; --accent:#4c9aff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 20px 80px}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+  .logo{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;
+        background:linear-gradient(135deg,#4c9aff,#8a63ff);font-weight:700;font-size:14px;color:#fff}
+  h1{font-size:22px;margin:0}
+  .sub{color:var(--muted);margin:0 0 28px;font-size:13px}
+  h2{font-size:17px;margin:34px 0 12px;padding-left:10px;border-left:3px solid var(--accent)}
+  h3{font-size:14px;margin:22px 0 8px;color:#c9d6e2}
+  p,li{color:#cfdae5}
+  code{font-family:var(--mono);font-size:12.5px;background:#20262f;padding:2px 6px;border-radius:5px;color:#ffd479}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;
+      overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.6;color:#cfe3ff}
+  pre code{background:none;padding:0;color:inherit}
+  table{width:100%;border-collapse:collapse;margin:10px 0 4px;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px;letter-spacing:.04em;text-transform:uppercase}
+  td code{white-space:nowrap}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:14px 0}
+  .note{border-left:3px solid var(--accent);background:#122033}
+  .warn{border-left:3px solid var(--warn);background:#241f10}
+  .ok{border-left:3px solid var(--ok);background:#10231a}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;
+       border:1px solid var(--line);color:var(--muted);margin-left:6px;vertical-align:middle}
+  .tag.req{color:var(--err);border-color:#5c2a2a}
+  .tag.opt{color:var(--muted)}
+  a{color:var(--accent)}
+  .back{position:fixed;right:24px;bottom:24px;background:var(--accent);color:#fff;text-decoration:none;
+        padding:10px 16px;border-radius:10px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="logo">H3</div>
+  <div>
+    <h1>模型权重下载与安装</h1>
+    <p class="sub">MiniMax-H3 / HyperFlow H3 Flash · 本页随 WebUI 一起分发，离线可看</p>
+  </div>
+</header>
+
+<div class="card note">
+  <b>先看这一句：</b>本项目<b>不含权重</b>。整套 ComfyUI_MiniMax-H3-V8 只需要
+  <b>五个文件</b>（约 49 GB）。文生视频 / 首尾帧用四个；<b>多图参考</b>再多一个
+  Ref2VA DiT（合计约 65 GB）。不用改名、不用 <code>config.json</code>、
+  不用 PDD LoRA —— 这些都要归功于 checkpoint 自带的 HyperFlow metadata。
+</div>
+
+<h2>1. 五个文件，按目录放好</h2>
+
+<p>最省事的做法：保持 ComfyUI 的 <code>models/</code> 目录结构不动，WebUI 会自动识别。
+把模型目录设为 <code>H3_MODEL_DIR</code>，或在页面的「模型」面板里选。</p>
+
+<pre><code>ComfyUI_MiniMax-H3-V8/ComfyUI/models/
+├── diffusion_models/
+│   ├── minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors   ≈15.9 GB
+│   └── minimax_h3_ref2va_hyperflow_flash_int8_convrot.safetensors   ≈16.3 GB
+├── text_encoders/
+│   └── qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf                          ≈14.6 GB
+└── vae/
+    ├── minimax_h3_sol_vae_int8_convrot.safetensors                  ≈1.99 GB
+    └── minimax_h3_audio_vae_fp32.safetensors                        ≈605 MB</code></pre>
+
+<table>
+  <thead><tr><th>文件</th><th>必须</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors</code></td>
+        <td><span class="tag req">必须</span></td><td>FL2VA DiT，47 个 block；文生视频与首尾帧都用这个</td></tr>
+    <tr><td><code>qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf</code></td>
+        <td><span class="tag req">必须</span></td><td>Qwen3-VL 文本编码器，GGUF Q4_K_M</td></tr>
+    <tr><td><code>minimax_h3_sol_vae_int8_convrot.safetensors</code></td>
+        <td><span class="tag req">必须</span></td><td>视频 VAE，24 层 decoder.blocks</td></tr>
+    <tr><td><code>minimax_h3_audio_vae_fp32.safetensors</code></td>
+        <td><span class="tag req">必须</span></td><td>音频 VAE，归一化参数已折叠进权重</td></tr>
+    <tr><td><code>minimax_h3_ref2va_hyperflow_flash_int8_convrot.safetensors</code></td>
+        <td><span class="tag opt">可选</span></td><td>Ref2VA DiT，49 个 block；只给「多图参考」用</td></tr>
+  </tbody>
+</table>
+
+<div class="card ok">
+  <b>不需要：</b><code>config.json</code>、<code>pdd_heads.safetensors</code>、
+  <code>pdd_lora.safetensors</code>、<code>tokenizer.json</code>。
+  层数、time embedder 宽度、sigma 表、gate 都从 safetensors 的
+  <code>__metadata__.hyperflow_int8</code> 读取；tokenizer 已随程序分发。
+</div>
+
+<h2>2. 从哪里下载</h2>
+<p>文件来自 <b>ComfyUI_MiniMax-H3-V8</b> 整合包所配套的仓库（Hugging Face /
+ModelScope 搜索上面的完整文件名）。下载前通常需要接受
+<b>MiniMax H3 Community License</b>。下载后保持原文件名即可，
+本项目的模型定位器按文件名关键字自动匹配。</p>
+<p>如果文件散落在别的目录，不必搬动 —— 见第 5 节「逐组件路径」。</p>
+
+<h2>3. 校验是否装对</h2>
+<p>启动 WebUI 时，控制台会打印模型来源目录和每个组件的<b>完整路径</b>：
+<code>[OK] FL2VA DiT ... F:/models/diffusion_models/minimax_h3_fl2va_...safetensors</code>。
+页面顶部也会列出缺失组件。也可以直接问后端：</p>
+<pre><code>curl -X POST http://127.0.0.1:7867/api/model/refresh
+# {"usable":true,"packDir":".../ComfyUI/models","comfyLayout":true,"ref2va":true,"missing":[]}</code></pre>
+<p>命令行只读自检（不需要生成）：</p>
+<pre><code>dist\win-x64\h3rt_smoke.exe   （在构建之后）</code></pre>
+
+<h2>4. 三种生成模式</h2>
+<table>
+  <thead><tr><th>模式</th><th>输入</th><th>额外权重</th></tr></thead>
+  <tbody>
+    <tr><td><code>t2v</code> 文生视频</td><td>提示词</td><td>—</td></tr>
+    <tr><td><code>fl2v</code> 首尾帧</td><td>提示词 + 首帧 / 尾帧</td><td>—</td></tr>
+    <tr><td><code>ref2v</code> 多图参考</td><td>提示词 + 最多 9 张有序参考图</td><td>Ref2VA DiT</td></tr>
+  </tbody>
+</table>
+<p>每种模式都内置了几条示例，点一下就会填入提示词、规格和示例图片，
+改两个词就能直接生成。参考图的<b>卡片序号</b>对应提示词里的「参考图 1 / 2 / …」。</p>
+
+<h2>5. 权重不想集中放？用逐组件路径</h2>
+<p>在 <code>appsettings.json</code> 里逐项指定绝对路径，留空的项回落到自动探测结果：</p>
+<pre><code>"H3": {
+  "Models": {
+    "Transformer": "E:/hf/minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors",
+    "Ref2vaTransformer": "E:/hf/minimax_h3_ref2va_hyperflow_flash_int8_convrot.safetensors",
+    "TextEncoder": "E:/hf/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf",
+    "VideoVae": "E:/hf/minimax_h3_sol_vae_int8_convrot.safetensors",
+    "AudioVae": "E:/hf/minimax_h3_audio_vae_fp32.safetensors"
+  }
+}</code></pre>
+<p>运行时会用<b>硬链接 / 目录联接（Windows）或符号链接（Linux）</b>拼出引擎认识的标准布局，
+不复制权重。缓存目录默认在模型包旁，可用 <code>H3:PackCacheDir</code> 指定。</p>
+
+<h2>6. 常见错误</h2>
+<table>
+  <thead><tr><th>现象</th><th>原因与处理</th></tr></thead>
+  <tbody>
+    <tr><td>「多图参考」模式不可选</td>
+        <td>没有 <code>minimax_h3_ref2va_...</code> 这个 DiT；其它四个组件与 FL2VA 共用。</td></tr>
+    <tr><td><code>cannot open .../config.json</code></td>
+        <td>使用了旧版模型包。本项目面向 HyperFlow Flash 五文件，不需要 config.json。</td></tr>
+    <tr><td><code>算力 89 ≠ 编译 120</code></td>
+        <td>原生库按别的 GPU 编译。用 <code>scripts\build.cmd &lt;算力&gt;</code> 重建，或换对应构建。</td></tr>
+    <tr><td>去噪异常慢（几十秒一步）</td>
+        <td>显存被其它进程占满，权重溢出到内存。检查 <code>nvidia-smi</code>。</td></tr>
+    <tr><td>提示 ffmpeg 相关失败</td>
+        <td>把 <code>ffmpeg</code> 与 <code>ffprobe</code> 放进 PATH，MP4 封装要用。</td></tr>
+  </tbody>
+</table>
+
+<h2>7. 许可</h2>
+<p>权重属于 MiniMax-H3 的衍生模型，遵循 <b>MiniMax H3 Community License Agreement</b>，
+在欧盟、英国、韩国、美国需另行获得 MiniMax 授权。
+公开分享生成内容时请标注“由 AI 生成”。本项目代码采用 Apache-2.0，<b>不包含任何权重</b>。</p>
+
+<a class="back" href="/">← 回到生成界面</a>
+</div>
+</body>
+</html>

@@ -84,6 +84,57 @@ if (!string.IsNullOrEmpty(modelDir) && Directory.Exists(modelDir))
     {
         Check(true, "empty prompt rejected before entering native code");
     }
+
+    // Per-component paths: instead of one pack root, name every weight source
+    // and let h3rt materialise the standard FL2VA/... layout as links. Opt-in
+    // because it costs a second full weight load.
+    if (Environment.GetEnvironmentVariable("H3_SMOKE_COMPONENTS") == "1")
+    {
+        string fl2va = Path.Combine(modelDir, "FL2VA");
+        var components = new H3ModelPaths
+        {
+            TextEncoder = Path.Combine(fl2va, "text_encoder"),
+            // A bare .safetensors: config.json and pdd_heads.safetensors must be
+            // linked in next to it from the same slot.
+            Transformer = Path.Combine(fl2va, "transformer", "model.safetensors"),
+            // The parent of source/ is accepted for the video VAE.
+            VideoVae = Path.Combine(fl2va, "video_vae"),
+            AudioVae = Path.Combine(fl2va, "audio_vae"),
+            Tokenizer = Path.Combine(fl2va, "tokenizer"),
+            PddLora = Path.Combine(fl2va, "pdd_lora.safetensors")
+        };
+
+        Console.WriteLine("per-component paths:");
+        using var composed = H3Runtime.Create(new H3RuntimeOptions
+        {
+            Models = components,
+            PackCacheDir = Path.Combine(Path.GetTempPath(), "h3rt-smoke-packs")
+        });
+
+        Check(composed.IsComposedPack, "engine reads a composed link pack");
+        Check(composed.PackDir is { Length: > 0 } &&
+              !string.Equals(composed.PackDir, modelDir, StringComparison.OrdinalIgnoreCase),
+              $"composed pack differs from the source pack: {composed.PackDir}");
+        Check(Directory.Exists(Path.Combine(composed.PackDir!, "FL2VA", "transformer")),
+              "FL2VA/transformer slot exists in the composed pack");
+        Check(File.Exists(Path.Combine(composed.PackDir!, "FL2VA", "transformer",
+                                       "pdd_heads.safetensors")),
+              "sidecar pdd_heads.safetensors linked next to the bare weight file");
+
+        using (JsonDocument model = JsonDocument.Parse(composed.ModelInfoJson))
+        {
+            Check(model.RootElement.GetProperty("text_encoder")
+                      .GetProperty("tensors").GetInt32() > 0,
+                  "text encoder tensors visible through the composed pack");
+            Check(model.RootElement.GetProperty("fl2va_transformer")
+                      .GetProperty("files").GetInt32() > 0,
+                  "DiT inventory visible through the composed pack");
+        }
+    }
+    else
+    {
+        Console.WriteLine("(set H3_SMOKE_COMPONENTS=1 to also test per-component paths)");
+    }
 }
 else
 {

@@ -149,8 +149,39 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
-int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
-    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+/* HyperFlow Flash samples a fixed number of steps on its own interval grid
+ * rather than the uniform base grid: the released knots are mapped through the
+ * video flow shift (12), and audio through its own shift (3) from the same
+ * base, which is exactly what time_shift_sigma does between the two.  The
+ * knots come from ComfyUI-HyperFlow-Flash loader_nodes.py RAW_SIGMAS. */
+int h3_hyperflow_schedule_build(int steps, h3_sigma_schedule *schedule) {
+    static const double knots4[] = {1.0, 0.681872, 0.205019, 0.036496, 0.0};
+    static const double knots6[] = {1.0, 0.825217, 0.471725, 0.147401,
+                                    0.049626, 0.015517, 0.0};
+    static const double knots8[] = {1.0, 0.931506, 0.839236, 0.703462, 0.5,
+                                    0.296538, 0.160764, 0.068494, 0.0};
+    const double *knots = NULL;
+    if (steps == 4) knots = knots4;
+    else if (steps == 6) knots = knots6;
+    else if (steps == 8) knots = knots8;
+    if (!schedule || !knots) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = steps;
+    for (int index = 0; index < steps; index++) {
+        double base = knots[index];
+        schedule->video[index] = (float)(
+            H3_VIDEO_SIGMA_SHIFT * base /
+            (1.0 + (H3_VIDEO_SIGMA_SHIFT - 1.0) * base));
+        schedule->audio[index] = (float)(
+            H3_AUDIO_SIGMA_SHIFT * base /
+            (1.0 + (H3_AUDIO_SIGMA_SHIFT - 1.0) * base));
+    }
+    schedule->video[steps] = 0.0f;
+    schedule->audio[steps] = 0.0f;
+    return 1;
+}
+
+int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
     float denominator = (float)evaluations;

@@ -709,24 +709,14 @@ static int read_weight(const h3_weight_store *store, const char *name,
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = find_text_tensor(store, name, &header);
     if (tensor) {
-        if (tensor->dtype != H3_DTYPE_BF16) {
-            fail(error, error_size,
-                 "weight %s has dtype %s, expected BF16 or an int8 pair", name,
-                 h3_dtype_name(tensor->dtype));
-            return 0;
-        }
         size_t elements = 0;
         if (!shape_matches(name, tensor, ndim, shape, &elements, error,
                            error_size))
             return 0;
-        if (!h3_gpu_tensor_read_file_bf16(destination, header->path,
-                                          tensor->file_offset, elements, error,
-                                          error_size)) {
-            if (error && error_size && !error[0])
-                fail(error, error_size, "cannot prefetch %s", name);
-            return 0;
-        }
-        return 1;
+        /* A quantised .gguf has no BF16 payload, so the store dequantises it;
+         * a safetensors shard is read straight into the destination. */
+        return h3_weight_read_into_bf16(store, name, destination, elements,
+                                        error, error_size);
     }
     char data_name[224];
     snprintf(data_name, sizeof(data_name), "%s._data", name);

@@ -776,6 +776,30 @@ static char *h3_path(const char *root, const char *relative) {
     return result;
 }
 
+static int h3_path_exists(const char *path) {
+    struct stat status;
+    return path && stat(path, &status) == 0;
+}
+
+/* Ref2VA releases only the transformer.  The text encoder, the tokenizer and
+ * both VAEs are shared with FL2VA, and a ComfyUI pack links just the two DiT
+ * checkpoints, so each component resolves against Ref2VA first and falls back
+ * to the FL2VA link when the Ref2VA one is absent. */
+static char *h3_component_path(const h3_ctx *ctx, int ref2va,
+                               const char *ref2va_relative,
+                               const char *fl2va_relative) {
+    char *candidate = h3_path(ctx->model_dir,
+                              ref2va ? ref2va_relative : fl2va_relative);
+    if (!candidate || !ref2va || h3_path_exists(candidate)) return candidate;
+    char *shared = h3_path(ctx->model_dir, fl2va_relative);
+    if (!shared) {
+        free(candidate);
+        return NULL;
+    }
+    free(candidate);
+    return shared;
+}
+
 /* Where the PDD adaptor lives for this pack: the pack-local link when it
  * exists (portable, and what the pack scripts create), else the historical
  * absolute path.  Resolved per pack rather than compiled in, because the
@@ -851,17 +875,25 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         return NULL;
     }
     /* Ref2VA is selected only by ordered-reference requests. Keep prompt-only
-     * FL2VA usable while that optional 62 GiB checkpoint is not installed. */
+     * FL2VA usable while that optional 62 GiB checkpoint is not installed.
+     * Availability is "the directory holds weights", not "it has an index":
+     * a single-file checkpoint (the released int8_convrot safetensors) has no
+     * model.safetensors.index.json. */
     char *ref_index = h3_path(
         ctx->model_dir, "Ref2VA/transformer/model.safetensors.index.json");
-    if (!ref_index) {
+    char *ref_single = h3_path(ctx->model_dir,
+                               "Ref2VA/transformer/model.safetensors");
+    if (!ref_index || !ref_single) {
+        free(ref_index);
+        free(ref_single);
         h3_set_error(ctx, "out of memory resolving optional Ref2VA path");
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);
         return NULL;
     }
-    int has_ref2va = h3_is_file(ref_index);
+    int has_ref2va = h3_is_file(ref_index) || h3_is_file(ref_single);
     free(ref_index);
+    free(ref_single);
     if (has_ref2va && !h3_inventory(
             ctx, "Ref2VA/transformer", &ctx->model.ref2va_transformer)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
@@ -1118,6 +1150,14 @@ static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
 }
 
+/* Loading the decoder is 24 blocks; decoding the video is a different number
+ * of tiles, and on a 56-frame run it is the single most expensive stage. It
+ * reports under its own name so the bar keeps moving through it instead of
+ * sitting on a finished "load". */
+static void h3_vae_decode_progress_bridge(int completed, int total, void *opaque) {
+    h3_progress_emit(opaque, "video VAE decode", completed, total);
+}
+
 static void h3_preview_vae_progress_bridge(int completed, int total,
                                            void *opaque) {
     h3_progress_emit(opaque, "preview VAE load", completed, total);
@@ -1371,6 +1411,22 @@ int h3_dit_preload(h3_ctx *ctx, const h3_params *params,
                                           "preload requires a context and parameters");
         return 0;
     }
+    /* Same detection as h3_generate: a HyperFlow checkpoint owns its sampling
+     * grid, so warming the PDD shape here would miss the first request. */
+    h3_params local = *params;
+    int hyperflow = 0;
+    {
+        char *transformer = h3_path(ctx->model_dir, "FL2VA/transformer");
+        hyperflow = transformer &&
+                    h3_st_dir_has_tensor(transformer, "hyperflow_sigmas");
+        free(transformer);
+    }
+    if (hyperflow) {
+        local.pdd8 = 0;
+        if (local.steps != 4 && local.steps != 6 && local.steps != 8)
+            local.steps = 6;
+        params = &local;
+    }
     /* The LoRA path is part of the weight identity, so it is resolved
      * before the key is built. */
     if (params->pdd8 && !h3_env_on("H3_LORA"))
@@ -1409,8 +1465,8 @@ int h3_dit_preload(h3_ctx *ctx, const h3_params *params,
     h3_sigma_schedule sigmas;
     memset(&sigmas, 0, sizeof(sigmas));
     int scheduled = params->pdd8 ? h3_pdd_schedule_build(&sigmas) :
-                                   h3_serving_schedule_build(params->steps,
-                                                             &sigmas);
+        hyperflow ? h3_hyperflow_schedule_build(params->steps, &sigmas) :
+                    h3_serving_schedule_build(params->steps, &sigmas);
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
                            latent_w, temporal.audio_t, temporal.frame_count,
                            NULL, 0, NULL, 0};
@@ -1473,6 +1529,26 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "prompt must not be empty");
         return NULL;
     }
+    /* A distilled HyperFlow checkpoint defines its own sampling grid and has no
+     * per-step PDD heads, so the PDD path cannot run it. Detect it from the
+     * checkpoint itself instead of asking the caller to know. */
+    h3_params local = *params;
+    int hyperflow = 0;
+    {
+        char *transformer = h3_path(ctx->model_dir, "FL2VA/transformer");
+        hyperflow = transformer &&
+                    h3_st_dir_has_tensor(transformer, "hyperflow_sigmas");
+        free(transformer);
+    }
+    if (hyperflow) {
+        if (local.pdd8 && !getenv("H3_QUIET"))
+            fprintf(stderr, "h3: HyperFlow checkpoint: sampling its own grid "
+                    "instead of the PDD 8-step one\n");
+        local.pdd8 = 0;
+        if (local.steps != 4 && local.steps != 6 && local.steps != 8)
+            local.steps = 6;
+    }
+    params = &local;
     if (!h3_valid_params(ctx, params)) return NULL;
     if (params->token_reduction)
         fprintf(stderr,
@@ -1563,16 +1639,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int conditioned = 0;
     int dit_is_cached = 0;
     int decoder_is_cached = 0;
-    char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
-    char *text_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/text_encoder" : "FL2VA/text_encoder");
-    char *dit_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/transformer" : "FL2VA/transformer");
-    char *vae_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
-    char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    char *tokenizer_path = h3_component_path(ctx, ref2va,
+        "Ref2VA/tokenizer/tokenizer.json", "FL2VA/tokenizer/tokenizer.json");
+    char *text_path = h3_component_path(ctx, ref2va,
+        "Ref2VA/text_encoder", "FL2VA/text_encoder");
+    char *dit_path = h3_component_path(ctx, ref2va,
+        "Ref2VA/transformer", "FL2VA/transformer");
+    char *vae_path = h3_component_path(ctx, ref2va,
+        "Ref2VA/video_vae/source", "FL2VA/video_vae/source");
+    char *audio_vae_path = h3_component_path(ctx, ref2va,
+        "Ref2VA/audio_vae", "FL2VA/audio_vae");
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
@@ -2153,6 +2229,12 @@ text_encode_done:
             h3_set_error(ctx, "cannot construct the PDD 8-step sigma schedule");
             goto cleanup;
         }
+    } else if (hyperflow) {
+        if (!h3_hyperflow_schedule_build(params->steps, &sigmas)) {
+            h3_set_error(ctx, "cannot construct the HyperFlow %d-step sigma "
+                         "schedule", params->steps);
+            goto cleanup;
+        }
     } else if (!h3_serving_schedule_build(params->steps, &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
@@ -2380,13 +2462,10 @@ text_encode_done:
     h3_vram_mark(&vram, "audio vae");
     if (progress.cancelled) goto cleanup;
     if (!preview_decoder && ctx->cache_enabled) {
-        h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(
             ctx, decoder_key, vae_path, latent_h, latent_w,
             h3_vae_progress_bridge, &progress,
             &decoder_is_cached, detail, sizeof(detail));
-        if (preview_decoder && ctx->video_decoder == preview_decoder)
-            h3_progress_emit(&progress, "video VAE load", 36, 36);
         if (!preview_decoder) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
@@ -2395,6 +2474,7 @@ text_encode_done:
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
+            h3_vae_decode_progress_bridge, &progress,
             detail, sizeof(detail)) :
         h3_video_vae_decode(
             vae_path, "h3_shaders.metal", video,

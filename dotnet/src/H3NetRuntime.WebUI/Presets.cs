@@ -1,6 +1,67 @@
 namespace H3NetRuntime.WebUI;
 
 /// <summary>
+/// The three ways to condition a clip, matching the ComfyUI-V8 workflows:
+/// text only (T2VA), first/last frame (FL2VA) and ordered references (Ref2VA).
+/// </summary>
+public static class GenerationModes
+{
+    public const string Text = "t2v";
+    public const string FirstLastFrame = "fl2v";
+    public const string Reference = "ref2v";
+
+    public static readonly ModeInfo[] All =
+    {
+        new()
+        {
+            Id = Text, Name = "文生视频",
+            Description = "只给提示词，模型自己设计镜头与声音"
+        },
+        new()
+        {
+            Id = FirstLastFrame, Name = "首尾帧",
+            Description = "给首帧或尾帧（可都给），补全中间过程"
+        },
+        new()
+        {
+            Id = Reference, Name = "多图参考",
+            Description = "按顺序参考最多 9 张图，需要 Ref2VA 权重",
+            RequiresRef2Va = true
+        }
+    };
+
+    public static ModeInfo Find(string? id) =>
+        All.FirstOrDefault(m => string.Equals(m.Id, id, StringComparison.OrdinalIgnoreCase))
+        ?? All[0];
+
+    /// <summary>
+    /// Applies the mode to the request: conditioning that the mode does not use
+    /// is dropped, so a leftover upload from a previous mode cannot silently
+    /// change what runs.
+    /// </summary>
+    public static ModeInfo Normalize(GenerateApiRequest request)
+    {
+        ModeInfo mode = Find(request.Mode);
+        request.Mode = mode.Id;
+
+        if (mode.Id != FirstLastFrame)
+        {
+            request.FirstFrame = null;
+            request.LastFrame = null;
+        }
+        if (mode.Id != Reference)
+        {
+            request.References = null;
+            request.ReferenceImages = null;
+            request.ReferenceImage = null;
+            request.ReferenceVideo = null;
+            request.ReferenceAudio = null;
+        }
+        return mode;
+    }
+}
+
+/// <summary>
 /// The "通用版" presets. They are the only knobs a general-edition user sees;
 /// the advanced edition can override every one of them.
 /// </summary>

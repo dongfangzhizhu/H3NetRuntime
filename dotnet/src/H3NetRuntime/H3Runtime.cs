@@ -12,7 +12,6 @@ public sealed class H3Runtime : IDisposable
 {
     private readonly H3RuntimeHandle _handle;
     private int _disposed;
-    private string? _modelDir;
 
     private H3Runtime(H3RuntimeHandle handle) => _handle = handle;
 
@@ -68,19 +67,48 @@ public sealed class H3Runtime : IDisposable
     {
         get
         {
-            if (_modelDir is not null) return _modelDir;
+            H3PackLocation location = Location;
+            return location.ModelDir.Length > 0 ? location.ModelDir : location.PackDir;
+        }
+    }
+
+    /// <summary>
+    /// The directory the engine reads from. When <see cref="H3ModelPaths"/> was
+    /// used this is the assembled link pack, not the pack the caller named.
+    /// </summary>
+    public string PackDir => Location.PackDir;
+
+    /// <summary>True when the components were linked together into a pack.</summary>
+    public bool IsComposedPack => Location.Composed;
+
+    private readonly record struct H3PackLocation(string ModelDir, string PackDir, bool Composed);
+
+    private H3PackLocation _location;
+    private bool _locationResolved;
+
+    private H3PackLocation Location
+    {
+        get
+        {
+            if (_locationResolved) return _location;
             try
             {
                 using JsonDocument document = JsonDocument.Parse(ModelInfoJson);
-                _modelDir = document.RootElement.TryGetProperty("model_dir", out JsonElement value)
-                    ? value.GetString() ?? string.Empty
-                    : string.Empty;
+                JsonElement root = document.RootElement;
+                string Read(string name) =>
+                    root.TryGetProperty(name, out JsonElement value)
+                        ? value.GetString() ?? string.Empty
+                        : string.Empty;
+                bool composed = root.TryGetProperty("composed_pack", out JsonElement flag) &&
+                                flag.ValueKind == JsonValueKind.True;
+                _location = new H3PackLocation(Read("model_dir"), Read("pack_dir"), composed);
             }
             catch (JsonException)
             {
-                _modelDir = string.Empty;
+                _location = new H3PackLocation(string.Empty, string.Empty, false);
             }
-            return _modelDir;
+            _locationResolved = true;
+            return _location;
         }
     }
 

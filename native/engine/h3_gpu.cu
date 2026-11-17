@@ -2561,7 +2561,65 @@ int h3_gpu_linear_bf16_accum(h3_gpu *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
+/* Fuse a HyperFlow factorized linear into the dense matrix the ordinary
+ * kernels consume: out[offset + row, column] = sum_r up[row, r] * down[r,
+ * column].  The checkpoint stores `down`/`up` as two BF16 factors precisely so
+ * that a dense copy never has to be resident (17 of 47 blocks would cost
+ * another 6.5 GiB); expanding into one shared scratch matrix per projection
+ * keeps the memory win and leaves every downstream kernel unchanged.
+ *
+ * cuBLAS is column-major, so the row-major product [out, in] is computed as
+ * C[in, out] = down^T (in x r) * up^T (r x out) with the operands' own layouts
+ * as lda/ldb, and ldc = in_dim gives the row offset for free. */
+int h3_gpu_lowrank_fuse(h3_gpu *gpu, h3_gpu_tensor *output,
+                        uint32_t output_row_offset, const h3_gpu_tensor *down,
+                        const h3_gpu_tensor *up, uint32_t rank,
+                        uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_lowrank_fuse_rows(gpu, output, output_row_offset, output_dim,
+                                    down, up, 0, rank, input_dim);
+}
 
+/* The same fusion for a band of `rows` output rows taken from `up` starting at
+ * `up_row_offset`.  The QKV kernel reads per-head triples, so the factorized
+ * q/k/v projections have to be scattered head by head instead of written as
+ * three contiguous thirds. */
+int h3_gpu_lowrank_fuse_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                             uint32_t output_row_offset, uint32_t rows,
+                             const h3_gpu_tensor *down,
+                             const h3_gpu_tensor *up, uint32_t up_row_offset,
+                             uint32_t rank, uint32_t input_dim) {
+    size_t down_count = (size_t)rank * input_dim;
+    size_t up_count = (size_t)(up_row_offset + rows) * rank;
+    size_t output_count = (size_t)rows * input_dim;
+    if (!gpu || !output || !down || !up ||
+        output->dtype != H3_GPU_BF16 || down->dtype != H3_GPU_BF16 ||
+        up->dtype != H3_GPU_BF16 || down->elements < down_count ||
+        up->elements < up_count ||
+        output->elements <
+            (size_t)output_row_offset * input_dim + output_count ||
+        !rank || !input_dim || !rows)
+        return h3_gpu_fail(gpu, "invalid low-rank fusion request");
+
+    h3_gpu_op_begin(gpu, H3_GPU_OP_LINEAR);
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    uint16_t *target = (uint16_t *)output->device +
+                       (size_t)output_row_offset * input_dim;
+    const uint16_t *source =
+        (const uint16_t *)up->device + (size_t)up_row_offset * rank;
+    cublasStatus_t status = cublasGemmEx(
+        gpu->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int)input_dim, (int)rows,
+        (int)rank, &alpha, down->device, CUDA_R_16BF, (int)input_dim,
+        source, CUDA_R_16BF, (int)rank, &beta, target, CUDA_R_16BF,
+        (int)input_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (!h3_cublas_check(gpu, status, "cublasGemmEx low-rank fusion")) {
+        h3_gpu_op_end(gpu);
+        return 0;
+    }
+    gpu->stats.direct_dispatches++;
+    h3_gpu_op_end(gpu);
+    return 1;
+}
 
 __global__ static void h3_adaln_bf16_kernel(
     const uint16_t *input, const uint16_t *weight, const uint16_t *modulation,

@@ -7,6 +7,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Upper bound on the transformer depth any checkpoint may declare; the real
+ * depth is read from the file, so this only sizes fixed arrays. */
+#define H3_WEIGHT_MAX_BLOCKS 64u
+
 typedef struct h3_weight_store h3_weight_store;
 
 /* Which Nunchaku SVDQuant release a store holds.  The int4 and fp4 packs have
@@ -48,6 +52,31 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape,
                                   char *error, size_t error_size);
+
+/* True when the store reads a single quantised .gguf instead of safetensors
+ * shards. Its tensors have no BF16 payload and no byte offset. */
+int h3_weight_is_gguf(const h3_weight_store *store);
+
+/* Depth of the transformer in this store, counted from the contiguous
+ * blocks.N.norm1.weight names.  The unpruned release has 50 blocks; HyperFlow
+ * Flash drops whole blocks and renumbers the survivors (fl2va 47, ref2va 49),
+ * so nothing may assume 50. Returns 0 when the store holds no blocks. */
+unsigned h3_weight_block_count(const h3_weight_store *store);
+
+/* Read a small F32 vector (latents_mean / latents_std) straight out of the
+ * checkpoint in `directory`, for the VAEs that ship their latent
+ * normalization as tensors instead of a config.json. */
+int h3_weight_read_f32_vector(const char *directory, const char *name,
+                              float *values, size_t count,
+                              char *error, size_t error_size);
+
+/* Read one weight into an already-allocated BF16 device tensor. Safetensors
+ * takes the zero-copy path straight into the destination; a GGUF tensor is
+ * dequantised on the host and uploaded, which is what lets the Qwen prefetch
+ * lanes read a quantised text encoder without knowing the container. */
+int h3_weight_read_into_bf16(const h3_weight_store *store, const char *name,
+                             h3_gpu_tensor *destination, size_t elements,
+                             char *error, size_t error_size);
 
 /* INT8 ConvRot checkpoints (Comfy/WanGP `int8_convrot`) store the DiT linears as
  * "<name>" I8 [rows, cols] plus a per-output-row F32 scale sidecar

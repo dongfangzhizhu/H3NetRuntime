@@ -1,10 +1,11 @@
-# Native build products (CMake)
+# CMake / native build trees
 /build/
 /build-*/
 cmake-build-*/
-/dist/
+/.cache/
 
-# MSVC / GCC intermediates
+# Compiler intermediates. The three prebuilt runtime binaries below are the
+# deliberate exception at the end of this file.
 *.obj
 *.o
 *.d
@@ -21,22 +22,38 @@ cmake-build-*/
 # .NET build products
 **/bin/
 **/obj/
+**/.vs/
 *.user
 *.suo
-.vs/
 
-# Generated media (the engine writes MP4/PNG outputs)
+# Generated videos, uploads, history and local caches
 /out/
 /outputs/
-/work/
+**/work/
+.h3rt-packs/
 *.mp4
-*.png
 *.ppm
-
-# ...but keep documentation screenshots
+*.png
+# ...but keep the documentation screenshots
 !/docs/*.png
+
+# Package output (produced by scripts/pack.* and CI)
+/dist/*
+!/dist/win-x64/
+!/dist/linux-x64/
+/dist/nuget/
+/dist/win-x64/*
+/dist/linux-x64/*
+!/dist/win-x64/h3rt.dll
+!/dist/win-x64/h3rt.lib
+!/dist/linux-x64/libh3rt.so
 
 # Local configuration with machine-specific paths / secrets
 /config/local*.json
 .env
 *.log
+
+# Editor / OS leftovers
+.DS_Store
+Thumbs.db
+*~

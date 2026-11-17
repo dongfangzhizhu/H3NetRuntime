@@ -35,6 +35,7 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
 int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
+                        h3_video_vae_progress progress, void *progress_opaque,
                         char *error, size_t error_size);
 void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder);
 

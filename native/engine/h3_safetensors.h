@@ -72,4 +72,10 @@ const char *h3_dtype_name(h3_dtype dtype);
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size);
 
+/* Cheap capability probe: does any safetensors shard in `directory` declare a
+ * tensor with this name?  Reads headers only, so it costs a few hundred KiB
+ * even for a 16 GiB checkpoint.  Used to pick the sampling schedule a
+ * distilled checkpoint was trained on before any weight is loaded. */
+int h3_st_dir_has_tensor(const char *directory, const char *name);
+
 #endif

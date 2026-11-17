@@ -1,0 +1,10 @@
+H3 .NET Runtime (h3rt)
+Copyright 2026 h3rt contributors
+
+This distribution includes the vendored C/CUDA engine under native/engine/,
+derived from h3-spark.c (https://github.com/alexhegit/h3-spark.c), originally
+antirez/h3.c. That engine is licensed under the MIT License; see
+native/engine/LICENSE and native/engine/THIRD_PARTY_NOTICES.md.
+
+Model weights are not distributed with this project. They are subject to the
+MiniMax-H3 / HyperFlow license published with the weights.

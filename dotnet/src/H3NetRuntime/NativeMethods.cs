@@ -17,37 +17,94 @@ internal static class NativeMethods
     }
 
     /// <summary>
-    /// Locates h3rt.dll / libh3rt.so. Search order: H3RT_NATIVE_DIR,
-    /// the app base directory, any dist/&lt;rid&gt; folder above it, the CWD,
-    /// then the platform default loader.
+    /// Locates h3rt.dll / libh3rt.so. Search order:
+    /// <list type="number">
+    /// <item><c>H3RT_NATIVE_DIR</c></item>
+    /// <item>the application base directory (a hand-copied DLL)</item>
+    /// <item><c>runtimes/&lt;rid&gt;/native/</c> — the NuGet package layout</item>
+    /// <item><c>dist/&lt;rid&gt;/</c> in any parent directory (source tree)</item>
+    /// <item>the current working directory</item>
+    /// <item>the platform default loader</item>
+    /// </list>
+    /// When nothing matches the exception lists every path that was tried,
+    /// because "DLL not found" with no paths is the least useful error a
+    /// packaged runtime can produce.
     /// </summary>
     private static nint ResolveLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
         if (libraryName != Library) return nint.Zero;
         string file = OperatingSystem.IsWindows() ? "h3rt.dll" : "libh3rt.so";
-        string rid = OperatingSystem.IsWindows() ? "win-x64" : "linux-x64";
+        string[] rids = RuntimeIdentifiers;
+        var tried = new List<string>();
 
-        string? explicitDir = Environment.GetEnvironmentVariable("H3RT_NATIVE_DIR");
-        if (!string.IsNullOrEmpty(explicitDir))
+        nint TryPath(string? path)
         {
-            nint fromEnv = TryLoad(Path.Combine(explicitDir, file));
-            if (fromEnv != nint.Zero) return fromEnv;
+            if (string.IsNullOrEmpty(path)) return nint.Zero;
+            tried.Add(path);
+            return TryLoad(path);
         }
 
-        nint handle = TryLoad(Path.Combine(AppContext.BaseDirectory, file));
+        string? explicitDir = Environment.GetEnvironmentVariable("H3RT_NATIVE_DIR");
+        nint handle = TryPath(explicitDir is null ? null : Path.Combine(explicitDir, file));
         if (handle != nint.Zero) return handle;
 
-        // Development layout: <repo>/dotnet/<project>/bin/<cfg>/<tfm> -> <repo>/dist/<rid>.
-        DirectoryInfo? dir = new(AppContext.BaseDirectory);
-        for (int depth = 0; depth < 8 && dir is not null; depth++, dir = dir.Parent)
+        handle = TryPath(Path.Combine(AppContext.BaseDirectory, file));
+        if (handle != nint.Zero) return handle;
+
+        foreach (string rid in rids)
         {
-            handle = TryLoad(Path.Combine(dir.FullName, "dist", rid, file));
+            handle = TryPath(Path.Combine(AppContext.BaseDirectory, "runtimes", rid, "native", file));
             if (handle != nint.Zero) return handle;
         }
 
-        handle = TryLoad(Path.Combine(Directory.GetCurrentDirectory(), file));
+        DirectoryInfo? dir = new(AppContext.BaseDirectory);
+        for (int depth = 0; depth < 8 && dir is not null; depth++, dir = dir.Parent)
+        {
+            foreach (string rid in rids)
+            {
+                handle = TryPath(Path.Combine(dir.FullName, "dist", rid, file));
+                if (handle != nint.Zero) return handle;
+            }
+        }
+
+        handle = TryPath(Path.Combine(Directory.GetCurrentDirectory(), file));
         if (handle != nint.Zero) return handle;
-        return TryLoad(file);
+
+        try
+        {
+            if (NativeLibrary.TryLoad(file, assembly, searchPath, out handle)) return handle;
+        }
+        catch (DllNotFoundException) { }
+        catch (BadImageFormatException) { }
+
+        throw new DllNotFoundException(
+            $"cannot load the native h3rt runtime ({file}). Tried:{Environment.NewLine}  " +
+            string.Join(Environment.NewLine + "  ", tried) + Environment.NewLine +
+            "Set H3RT_NATIVE_DIR to the directory holding the native library, or copy it " +
+            "next to the application.");
+    }
+
+    private static readonly string[] RuntimeIdentifiers = BuildRuntimeIdentifiers();
+
+    private static string[] BuildRuntimeIdentifiers()
+    {
+        var rids = new List<string>();
+        string current = RuntimeInformation.RuntimeIdentifier;
+        if (!string.IsNullOrEmpty(current)) rids.Add(current);
+
+        string arch = RuntimeInformation.ProcessArchitecture switch
+        {
+            Architecture.X64 => "x64",
+            Architecture.Arm64 => "arm64",
+            Architecture.X86 => "x86",
+            _ => "x64"
+        };
+        string family = OperatingSystem.IsWindows() ? "win"
+            : OperatingSystem.IsLinux() ? "linux"
+            : OperatingSystem.IsMacOS() ? "osx"
+            : "win";
+        rids.Add(family + "-" + arch);
+        return rids.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
     private static nint TryLoad(string path)
