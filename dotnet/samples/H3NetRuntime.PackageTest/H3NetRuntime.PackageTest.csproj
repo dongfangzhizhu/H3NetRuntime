@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>H3NetRuntime.PackageTest</RootNamespace>
+    <AssemblyName>H3NetRuntime.PackageTest</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Deliberately references the published NuGet package, not the sibling
+         project, so this program also verifies the native assets shipped in
+         runtimes/<rid>/native/ by H3NetRuntime 1.0.0. -->
+    <PackageReference Include="H3NetRuntime" Version="1.0.0" />
+  </ItemGroup>
+
+</Project>

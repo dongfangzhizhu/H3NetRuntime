@@ -205,6 +205,20 @@ bash scripts/build.sh 89
 bash scripts/pack.sh 89
 ```
 
+`dotnet/samples/H3NetRuntime.PackageTest` 是一个**只引用已发布 NuGet 包**
+（`PackageReference H3NetRuntime 1.0.0`）的控制台程序，用本机五个权重文件
+依次跑通文生视频、首尾帧、多图参考：
+
+```bat
+dotnet run --project dotnet\samples\H3NetRuntime.PackageTest -c Release -- --list
+dotnet run --project dotnet\samples\H3NetRuntime.PackageTest -c Release -- --mode all
+```
+
+`--mode t2v|fl2v|ref2v|all`、`--model-dir`、`--out-dir`、`--width`、
+`--height`、`--frames`、`--steps`、`--seed` 均可覆盖；视频写到
+`work/package-test/`。若本机曾缓存过同名旧版包，先执行
+`dotnet nuget locals global-packages --clear`。
+
 `build-native.cmd` 不调用 `vcvars64.bat`，而是从磁盘上的 MSVC / Windows SDK
 直接推导环境变量，适合受限环境。CUDA 12 与发行版 CMake 3.25 的
 `FindCUDAToolkit` 会因已删除的 `CUDA::nvToolsExt` 报错，建议 CMake ≥ 3.31。
