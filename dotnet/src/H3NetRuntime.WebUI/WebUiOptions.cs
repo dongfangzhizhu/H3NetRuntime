@@ -23,6 +23,28 @@ public sealed class WebUiOptions
     public string? PackCacheDir { get; set; }
 
     public bool PreloadOnStart { get; set; }
+
+    /// <summary>
+    /// Keep the ~9.5 GiB resident video VAE decoder mapped between jobs. Off
+    /// by default: on a 24 GiB card, combining this with <see cref="KeepDit"/>
+    /// fills VRAM and the next job can degrade to a multi-hour-per-step path.
+    /// Legacy name <c>CacheEnabled</c> is honoured as an alias.
+    /// </summary>
+    public bool KeepResidentVae { get; set; }
+
+    /// <summary>
+    /// Legacy alias for <see cref="KeepResidentVae"/> from older config files.
+    /// When set it is OR-ed in during <see cref="Normalize"/>.
+    /// </summary>
+    public bool? CacheEnabled { get; set; }
+
+    /// <summary>
+    /// Keep the DiT mapped after each generation (faster repeat calls). Safe to
+    /// leave on when <see cref="KeepResidentVae"/> is off — the DiT shares pages
+    /// with the one-shot VAE through the stream allocator.
+    /// </summary>
+    public bool KeepDit { get; set; } = true;
+
     public int MaxHistory { get; set; } = 60;
     public int Port { get; set; } = 7867;
 
@@ -45,6 +67,8 @@ public sealed class WebUiOptions
         string assets = assetsDirectory ?? baseDirectory;
         Edition = Advanced ? "advanced" : "general";
         if (string.IsNullOrWhiteSpace(Host)) Host = "127.0.0.1";
+        // Backwards compatibility: older configs called this switch CacheEnabled.
+        if (CacheEnabled == true) KeepResidentVae = true;
         OutputDir = Resolve(baseDirectory, OutputDir);
         UploadDir = Resolve(baseDirectory, UploadDir);
         HistoryFile = Resolve(baseDirectory, HistoryFile);

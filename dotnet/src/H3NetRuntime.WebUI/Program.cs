@@ -1,6 +1,13 @@
+using System.Text;
 using H3NetRuntime;
 using H3NetRuntime.WebUI;
 using Microsoft.Extensions.FileProviders;
+
+// The demo/executable messages are Chinese. On a Windows console the default
+// OEM code page renders them as mojibake (and redirecting to a log file keeps
+// the damage); force UTF-8 so console and piped logs stay readable everywhere.
+try { Console.OutputEncoding = new UTF8Encoding(false); }
+catch (Exception) { /* redirected streams on some hosts refuse a re-encode */ }
 
 var switchMappings = new Dictionary<string, string>
 {
@@ -11,7 +18,9 @@ var switchMappings = new Dictionary<string, string>
     ["--model-root"] = "H3:ModelRoot",
     ["--config"] = "H3:ConfigPath",
     ["--output"] = "H3:OutputDir",
-    ["--preload"] = "H3:PreloadOnStart"
+    ["--preload"] = "H3:PreloadOnStart",
+    ["--keep-resident-vae"] = "H3:KeepResidentVae",
+    ["--keep-dit"] = "H3:KeepDit"
 };
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -113,11 +122,12 @@ app.MapGet("/api/config", (WebUiOptions o, RuntimeHost host) =>
             Required = c.Required,
             Present = c.Present
         }).ToList(),
-        ModelSearchPaths = discovery.Searched.Select(Slash).ToList()
+        ModelSearchPaths = discovery.Searched.Select(Slash).ToList(),
+        VaePath = VaePathOf(o)
     };
 });
 
-app.MapGet("/api/status", (RuntimeHost host, JobManager queue) =>
+app.MapGet("/api/status", (WebUiOptions o, RuntimeHost host, JobManager queue) =>
 {
     bool loaded = host.TryEnsure(out _, out string? error);
     return new StatusResponse
@@ -128,7 +138,8 @@ app.MapGet("/api/status", (RuntimeHost host, JobManager queue) =>
         DeviceInfoJson = host.DeviceInfoJson,
         ModelInfoJson = host.ModelInfoJson,
         CacheInfoJson = host.CacheInfoJson,
-        Busy = queue.Active().Any(j => j.Status is "running" or "cancelling")
+        Busy = queue.Active().Any(j => j.Status is "running" or "cancelling"),
+        VaePath = VaePathOf(o)
     };
 });
 
@@ -317,3 +328,10 @@ app.Run();
 
 /// <summary>Windows paths read better with forward slashes in JSON and HTML.</summary>
 static string Slash(string path) => path.Replace('\\', '/');
+
+/// <summary>
+/// The effective video-VAE path. "resident-slow" means the ~9.5 GiB decoder is
+/// kept in VRAM between jobs; on a 24 GiB card that can leave no headroom and
+/// stall a consecutive generation. "fast" is the safe one-shot default.
+/// </summary>
+static string VaePathOf(WebUiOptions o) => o.KeepResidentVae ? "resident-slow" : "fast";

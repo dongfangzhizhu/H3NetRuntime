@@ -79,8 +79,8 @@ public sealed class RuntimeHost : IDisposable
                     // A missing explicit config file is a hard error in the
                     // engine, so only forward it when it exists.
                     ConfigPath = UsableConfigPath(),
-                    KeepDit = true,
-                    CacheEnabled = true,
+                    KeepDit = _options.KeepDit,
+                    CacheEnabled = _options.KeepResidentVae,
                     TextCacheDir = Environment.GetEnvironmentVariable("H3_TEXT_CACHE_DIR")
                 });
                 _modelDir = _runtime.ModelDir;
@@ -147,8 +147,9 @@ public sealed class RuntimeHost : IDisposable
                     Models = _discovery.Models.IsEmpty ? null : _discovery.Models,
                     PackCacheDir = _options.PackCacheDir,
                     ConfigPath = UsableConfigPath(),
-                    KeepDit = true,
-                    CacheEnabled = true
+                    KeepDit = _options.KeepDit,
+                    CacheEnabled = _options.KeepResidentVae,
+                    TextCacheDir = Environment.GetEnvironmentVariable("H3_TEXT_CACHE_DIR")
                 });
                 _modelDir = _runtime.ModelDir;
                 _lastError = null;

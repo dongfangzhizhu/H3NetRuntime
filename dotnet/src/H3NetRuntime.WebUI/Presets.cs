@@ -119,7 +119,11 @@ public static class Presets
         new() { Label = "640 × 480 (4:3)", Width = 640, Height = 480 },
         new() { Label = "480 × 640 (3:4 竖屏)", Width = 480, Height = 640 },
         new() { Label = "576 × 1024 (9:16 竖屏)", Width = 576, Height = 1024 },
-        new() { Label = "1024 × 576 (16:9 宽屏)", Width = 1024, Height = 576 }
+        new() { Label = "1024 × 576 (16:9 宽屏)", Width = 1024, Height = 576 },
+        // Matches the original ComfyUI workflow's native canvas. KeepDit is on
+        // and the resident VAE off by default, so this fits a 24 GiB card; for
+        // smaller cards drop KeepDit or use a smaller canvas.
+        new() { Label = "1344 × 768 (16:9 原生规格)", Width = 1344, Height = 768 }
     };
 
     public static PresetDefinition Find(string? id) =>

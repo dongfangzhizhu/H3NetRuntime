@@ -29,11 +29,32 @@ public sealed class H3RuntimeOptions
     /// <summary>On-disk prompt embedding cache directory.</summary>
     public string? TextCacheDir { get; set; }
 
-    /// <summary>Reuse resident weights / text embeddings between calls.</summary>
-    public bool CacheEnabled { get; set; } = true;
+    /// <summary>
+    /// Reuse the ~9.5 GiB resident video VAE decoder and the text/conditioning
+    /// cache between calls. Off by default: on a 24 GiB card, keeping both this
+    /// decoder and <see cref="KeepDit"/> resident leaves no VRAM headroom, so a
+    /// second generation in the same process can drop into a multi-hour-per-step
+    /// path while CUDA thrashes. Turn it on only for a single long-lived process
+    /// where repeated calls are spaced out and VRAM pressure is monitored.
+    /// </summary>
+    public bool CacheEnabled { get; set; }
 
-    /// <summary>Keep the DiT mapped after each generation (faster repeat calls).</summary>
+    /// <summary>
+    /// Keep the DiT mapped after each generation (faster repeat calls). This is
+    /// independent of <see cref="CacheEnabled"/>: the DiT stays resident while
+    /// the large VAE decoder is released, which is the safe combination for
+    /// back-to-back generations.
+    /// </summary>
     public bool KeepDit { get; set; } = true;
+
+    /// <summary>
+    /// "fast" when the resident VAE decoder is released between calls,
+    /// "resident-slow" when caching keeps it mapped. Mirrors the engine's
+    /// effective VAE residency for callers that want to detect the risky path
+    /// before submitting a batch.
+    /// </summary>
+    [JsonIgnore]
+    public string VaePath => CacheEnabled ? "resident-slow" : "fast";
 
     /// <summary>Extra options forwarded verbatim to the native layer.</summary>
     public Dictionary<string, object?> Extra { get; } = new();

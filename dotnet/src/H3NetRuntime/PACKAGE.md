@@ -10,7 +10,9 @@ using H3NetRuntime;
 
 using var runtime = H3Runtime.Create(new H3RuntimeOptions
 {
-    ModelDir = @"D:\models\ComfyUI_MiniMax-H3-V8\ComfyUI\models"
+    ModelDir = @"D:\models\ComfyUI_MiniMax-H3-V8\ComfyUI\models",
+    KeepDit = true,        // default: keep the DiT mapped (safe on its own)
+    CacheEnabled = false   // default: release the ~9.5 GiB VAE decoder between calls
 });
 
 var result = await runtime.GenerateAsync(new H3GenerateRequest
@@ -84,6 +86,15 @@ var runtime = H3Runtime.Create(new H3RuntimeOptions
 Unset components fall back to the same slot under `ModelDir`. `PackDir` reports
 the directory the engine actually reads, and `IsComposedPack` says whether it
 was assembled.
+
+## Residency and consecutive generations
+
+`CacheEnabled` (the resident video-VAE decoder) is **off by default**;
+`KeepDit` stays on. On a 24 GiB card, enabling both keeps the ~16 GiB DiT and
+the ~9.5 GiB decoder mapped at once with no headroom, so a second generation in
+the same process can degrade to minutes-or-hours per step instead of failing.
+Leave the defaults as-is for batch/back-to-back work. `H3RuntimeOptions.VaePath`
+reports `"fast"` (safe) or `"resident-slow"` (risky) for health checks.
 
 ## Notes
 

@@ -161,6 +161,13 @@ public sealed class ConfigResponse
     public int MaxReferenceVideos { get; set; } = 3;
     public int MaxReferenceAudios { get; set; } = 3;
     public int MaxReferences { get; set; } = 12;
+
+    /// <summary>
+    /// Effective video-VAE path: "fast" (one-shot decode, default) or
+    /// "resident-slow" (decoder kept in VRAM between jobs). See the README's
+    /// "consecutive generations" section before enabling the latter.
+    /// </summary>
+    public string VaePath { get; set; } = "fast";
 }
 
 /// <summary>One generation mode.</summary>
@@ -196,6 +203,9 @@ public sealed class StatusResponse
     public string ModelInfoJson { get; set; } = "{}";
     public string CacheInfoJson { get; set; } = "{}";
     public bool Busy { get; set; }
+
+    /// <summary>"fast" or "resident-slow" — see <see cref="ConfigResponse.VaePath"/>.</summary>
+    public string VaePath { get; set; } = "fast";
 }
 
 public sealed class PreloadResponse
@@ -242,6 +252,12 @@ public sealed class JobView
     [JsonPropertyName("previewUrl")] public string? PreviewUrl { get; set; }
     [JsonPropertyName("livePreview")] public bool LivePreview { get; set; }
     [JsonPropertyName("queuePosition")] public int QueuePosition { get; set; }
+
+    /// <summary>
+    /// Effective video-VAE path used by this job: "fast" or "resident-slow".
+    /// Lets a caller detect the VRAM-hungry resident path from a job snapshot.
+    /// </summary>
+    [JsonPropertyName("vaePath")] public string VaePath { get; set; } = "fast";
 }
 
 public sealed class JobSummary

@@ -25,7 +25,8 @@ H3NetRuntime.dll ────── h3rt.dll / libh3rt.so ───────�
 - 权重可以散落在任意目录，运行时用硬链接 / 目录联接拼出引擎需要的布局，
   **不复制几十 GB 文件**；
 - 控制台打印每个模型组件的**完整解析路径**；WebUI 显示整体进度、阶段耗时与 ETA；
-- NuGet 包内带 win-x64 / linux-x64 原生资产，消费方无需部署脚本。
+- NuGet 包内带 win-x64 / linux-x64 原生资产，消费方无需部署脚本；
+- **连续生成默认走安全路径**：一次进程内批量出片不会掉进「第二步起每步数小时」的显存抖动陷阱（见下方「连续生成与显存」）。
 
 **边界**：加壳的 ComfyUI Python 代码没有被逆向；兼容性是工作流能力级的，
 不保证与 ComfyUI 逐像素一致。只服务 MiniMax-H3 / HyperFlow H3 Flash 这一套
@@ -107,6 +108,35 @@ dotnet run --project dotnet/src/H3NetRuntime.WebUI -c Release -- --edition gener
 任务进度按阶段加权汇总、单调不回退，控制台每 5 秒或每跨一个阶段打印一行，
 例如 `去噪采样  24/56  72.8%  01:42 · 剩余约 00:39`。
 
+### 连续生成与显存（重要）
+
+一次进程内连续出多个镜头时，**别把 DiT 和常驻 VAE 解码器同时留在显存里**。
+在 24 GiB 显卡上，DiT（约 16 GiB）+ 常驻 VAE 解码器（约 9.5 GiB）会占满整张卡，
+后续任务的编码/解码 kernel 无显存可用，退化为 host 内存抖动——表现是**第二个任务
+起某一步卡住数小时**，而不是报错。这不是 dtype 反量化慢：日志里的
+`dtype normalisation ... in 1–3 s` 和 `[h3rt] 453.9s video VAE load` 分别是
+一次性的归一化耗时和「距任务开始的累计秒数」，并非单步耗时。
+
+因此默认组合为 **`KeepDit=true` + `KeepResidentVae=false`**：
+
+| 配置（appsettings.json 的 `H3` 段 / CLI） | 默认 | 含义 |
+|---|---|---|
+| `KeepDit` / `--keep-dit` | `true` | 生成后保留 DiT 映射，重复调用更快；单独开启安全 |
+| `KeepResidentVae` / `--keep-resident-vae` | `false` | 把约 9.5 GiB 的 VAE 解码器常驻；**与 KeepDit 同开才会占满显存** |
+| `CacheEnabled`（旧别名） | — | 旧配置里的同名开关，`true` 视作 `KeepResidentVae=true` |
+
+- 需要回退到旧行为时把 `KeepResidentVae` 设为 `true`（仅限单任务或对显存余量有把握的场景）。
+- C# 侧对应 `H3RuntimeOptions.KeepDit` 与 `H3RuntimeOptions.CacheEnabled`（后者即常驻 VAE 开关，默认已改为 `false`）。
+- `GET /api/config`、`GET /api/status` 和 `GET /api/jobs/{id}` 返回 `vaePath`：
+  `fast`（一次性解码，安全默认）或 `resident-slow`（常驻解码器，有抖动风险）。
+  批量任务启动前可先读这个字段判断。
+- 原生层仍保留 `H3_VAE_NO_PREFETCH` 环境变量用于关闭 VAE 权重的后台预读；
+  预读本身只填充 page cache，不是上面这条慢路径的成因。
+
+排查时：日志关键行以 `h3:`（native）和 `[h3rt]`（累计耗时）为前缀；
+`[h3rt]` 的时间戳是从任务开始计的累计秒数，看某阶段真实耗时要用相邻两行相减，
+或直接看控制台的阶段耗时列。
+
 ### 4. 在 C# 里调用
 
 ```bash
@@ -120,7 +150,8 @@ using var cts = new CancellationTokenSource();
 using var runtime = H3Runtime.Create(new H3RuntimeOptions
 {
     ModelDir = @"D:\models\ComfyUI_MiniMax-H3-V8\ComfyUI\models",
-    KeepDit = true
+    KeepDit = true,        // 默认：保留 DiT，安全
+    CacheEnabled = false   // 默认：不常驻 VAE 解码器，避免连续生成抖动
 });
 
 Console.WriteLine(runtime.DeviceInfoJson);
@@ -183,10 +214,10 @@ WebUI 的 JSON API：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/config`、`/api/status`、`/api/health` | 配置、设备/模型状态、健康检查 |
-| POST | `/api/generate` | 入队生成，返回任务快照 |
-| GET | `/api/jobs/{id}` | 状态、整体进度、阶段、ETA、实时预览 |
-| POST | `/api/jobs/{id}/cancel` | 取消任务 |
+| GET | `/api/config`、`/api/status`、`/api/health` | 配置、设备/模型状态、健康检查；前两者含 `vaePath` |
+| POST | `/api/generate` | 入队生成，返回任务快照（含 `vaePath`） |
+| GET | `/api/jobs/{id}` | 状态、整体进度、阶段、ETA、实时预览、`vaePath` |
+| POST | `/api/jobs/{id}/cancel` | 取消任务；`{id}` 可用唯一的 job id 前缀；取消返回后主动清缓存释放显存 |
 | GET | `/api/history` | 历史摘要（最多 60 条） |
 | POST | `/api/upload` | 上传参考图（≤ 512 MB） |
 | POST | `/api/preload`、`/api/cache/clear`、`/api/model/refresh`、`/api/model/select` | 预热 / 缓存 / 模型管理 |
@@ -231,8 +262,10 @@ dotnet run --project dotnet\samples\H3NetRuntime.PackageTest -c Release -- --mod
 | ref2v | 512×512 / 22 帧 / 8 步、2 张参考图 | 362 s（热缓存），赤狐 + 雪林构图一致 |
 | WebUI | 三种模式 + 全部内置 demo | demo 数量 / 素材载入 / 无 JS 报错 |
 
-冷启动主要花在读权重；常驻进程 + `Preload` / 「预热模型」是这套引擎合理的用法。
-注意显存：被其它进程占用时 DiT 会溢出到内存，去噪可从约 1.5 s/步退化到 80 s/步。
+冷启动主要花在读权重；常驻进程 + `Preload` / 「预热模型」配合默认的
+`KeepDit=true` / `KeepResidentVae=false` 是连续生成的安全用法。注意显存：
+两者同时常驻会把 24 GiB 卡占满，后续任务可从约 1.5 s/步退化到 80 s/步甚至更糟；
+显存被其它进程占用时同理。**连续批量出片请保持 `KeepResidentVae=false`。**
 
 ## NuGet 包与 GitHub 发布
 
@@ -262,7 +295,10 @@ PACKAGE.md, NOTICE
 ## 已知限制
 
 - 原生库按**单个 CUDA 算力**编译；换显卡要用 `scripts/build.cmd <算力>` 重建。
-- 单个 handle 串行生成；取消在引擎的下一个检查点生效，不是立即中断。
+- 单个 handle 串行生成；取消在引擎的下一个检查点生效，不是立即中断。取消返回后会
+  主动清一次缓存以尽快释放显存，但仍以引擎检查点为准。
+- `KeepDit` 与 `KeepResidentVae` 同时开启需要约 26 GiB 显存；24 GiB 卡请使用默认组合。
+  UI 分辨率已提供 1344 × 768（原生规格），大画布请配合默认 residency 设置。
 - 冷启动约 2–6 分钟（读 16–33 GB 权重）；一次性短任务不划算。
 - Linux 侧已验证编译、加载与 ABI 自检，完整生成链路在 Windows + RTX 4090 上验证。
 - WebUI 用轮询（约 550 ms）取任务状态，面向单机自用。

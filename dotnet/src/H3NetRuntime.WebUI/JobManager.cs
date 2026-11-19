@@ -238,9 +238,25 @@ public sealed class JobManager : IDisposable
 
     public IReadOnlyList<JobSummary> History() => _history.Snapshot();
 
-    public bool Cancel(string id)
+    /// <summary>
+    /// Cancels a job by full id or by a unique id prefix. A prefix that matches
+    /// more than one active job is rejected so a short string can never cancel
+    /// the wrong generation.
+    /// </summary>
+    public bool Cancel(string idOrPrefix)
     {
-        if (!_jobs.TryGetValue(id, out Job? job)) return false;
+        if (string.IsNullOrWhiteSpace(idOrPrefix)) return false;
+        string id = idOrPrefix.Trim();
+        if (!_jobs.TryGetValue(id, out Job? job))
+        {
+            Job[] matches = _jobs.Values
+                .Where(j => j.Status is "queued" or "running" or "cancelling")
+                .Where(j => j.Id.StartsWith(id, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (matches.Length != 1) return false;
+            job = matches[0];
+            id = job.Id;
+        }
         lock (job.Sync)
         {
             if (job.Status is "completed" or "failed" or "cancelled") return false;
@@ -361,6 +377,11 @@ public sealed class JobManager : IDisposable
         {
             stopwatch.Stop();
             preview?.CompleteAsync().GetAwaiter().GetResult();
+            // Generation has returned, so no native thread still owns the
+            // buffers. Drop cached decoder/embeddings now instead of leaving
+            // the cancelled job's VRAM held until the next cache clear.
+            try { runtime.ClearCache(); }
+            catch (Exception ex) { _logger.LogDebug(ex, "cache clear after cancel failed"); }
             Finish(job, "cancelled", null);
             TryDelete(job.OutputPath);
         }
@@ -413,7 +434,7 @@ public sealed class JobManager : IDisposable
             SsdStreaming = r.SsdStreaming,
             UseInt8RowFc2 = r.UseInt8RowFc2,
             UseReferenceRope = r.UseReferenceRope,
-            KeepDit = true,
+            KeepDit = r.KeepDit ?? _options.KeepDit,
             ReferenceImage = ResolveUpload(r.ReferenceImage),
             ReferenceVideo = ResolveUpload(r.ReferenceVideo),
             ReferenceAudio = ResolveUpload(r.ReferenceAudio),
@@ -589,7 +610,7 @@ public sealed class JobManager : IDisposable
 
     // -------------------------------------------------------------- snapshot
 
-    private static JobView Snapshot(Job job)
+    private JobView Snapshot(Job job)
     {
         lock (job.Sync)
         {
@@ -611,6 +632,7 @@ public sealed class JobManager : IDisposable
                 VideoUrl = job.VideoUrl,
                 PosterUrl = job.PosterUrl ?? job.Preview?.PosterUrl,
                 LivePreview = job.LivePreview,
+                VaePath = _options.KeepResidentVae ? "resident-slow" : "fast",
                 Progress = job.Phase.Length == 0 && job.Status == "queued"
                     ? null
                     : new JobProgressView
