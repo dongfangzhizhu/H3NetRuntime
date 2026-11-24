@@ -35,7 +35,7 @@
 #  define H3RT_CALL
 #endif
 
-#define H3RT_VERSION "1.0.0"
+#define H3RT_VERSION "1.2.0"
 #define H3RT_ABI_VERSION 1
 
 #ifdef __cplusplus

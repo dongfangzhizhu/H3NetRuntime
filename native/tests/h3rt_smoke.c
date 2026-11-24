@@ -77,6 +77,15 @@ int main(int argc, char **argv) {
             char *model = h3rt_model_info(handle);
             char *cache = h3rt_cache_info(handle);
             check(device && model && cache, "introspection returns JSON");
+            if (model) {
+                int hyperflow = strstr(model, "\"hyperflow\":true") != NULL;
+                int has_grid = strstr(model, "\"checkpoint_sigmas\"") != NULL;
+                printf("  sampling: hyperflow=%d grid=%d\n", hyperflow, has_grid);
+                /* A HyperFlow pack reports its grid; other packs have no such
+                 * tensor. Both are valid, so only assert the pair agrees. */
+                check(hyperflow == has_grid,
+                      "checkpoint sampling knots match HyperFlow detection");
+            }
             printf("  device: %s\n", device ? device : "(null)");
             printf("  model:  %s\n", model ? model : "(null)");
             printf("  cache:  %s\n", cache ? cache : "(null)");

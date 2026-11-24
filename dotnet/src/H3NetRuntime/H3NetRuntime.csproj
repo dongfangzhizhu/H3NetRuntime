@@ -15,7 +15,7 @@
   <!-- NuGet packaging metadata -->
   <PropertyGroup>
     <PackageId>H3NetRuntime</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>h3rt contributors</Authors>
     <Company>h3rt</Company>
     <Product>H3 .NET Runtime</Product>
@@ -27,7 +27,7 @@
     <PackageTags>minimax;h3;hyperflow;video-generation;diffusion;cuda;native;pinvoke</PackageTags>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageReadmeFile>PACKAGE.md</PackageReadmeFile>
-    <PackageReleaseNotes>1.1.0 — safer residency defaults: the resident video VAE decoder is off by default to avoid the multi-hour-per-step VRAM-thrash path on consecutive generations; KeepDit stays on. Adds H3RuntimeOptions.VaePath health hint. 1.0.0 — per-component model paths, first/last frame and reference conditioning, native runtimes for win-x64 and linux-x64.</PackageReleaseNotes>
+    <PackageReleaseNotes>1.2.0 — HyperFlow-native 4/6/8-step sampling: explicit Steps is no longer overwritten by the legacy pdd8 default; the checkpoint's hyperflow_sigmas tensor now drives the 6-step grid; WebUI presets use the official 6-step default. 1.1.0 — safer residency defaults: the resident video VAE decoder is off by default to avoid the multi-hour-per-step VRAM-thrash path on consecutive generations; KeepDit stays on. Adds H3RuntimeOptions.VaePath health hint. 1.0.0 — per-component model paths, first/last frame and reference conditioning, native runtimes for win-x64 and linux-x64.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <Deterministic>true</Deterministic>

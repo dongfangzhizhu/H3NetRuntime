@@ -124,6 +124,12 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
  * A checkpoint that carries hyperflow_sigmas must use this instead of the
  * uniform grid: its distilled weights were trained on these exact knots. */
 int h3_hyperflow_schedule_build(int steps, h3_sigma_schedule *schedule);
+/* Build the same schedule from a checkpoint-owned `hyperflow_sigmas` tensor.
+ * The tensor stores the video-shifted knots (shift 12); audio knots are
+ * recovered by undoing that shift and applying shift 3, the mapping
+ * `shift_sigmas` in HyperFlow's schedule.py uses on the raw grid. */
+int h3_hyperflow_schedule_from_stored(const float *video, int steps,
+                                      h3_sigma_schedule *schedule);
 /* PDD's 8-step schedule (shift 12 video, 3 audio), fixed at
  * H3_PDD_NUM_STEPS / H3_PDD_BLOCK_SIZE steps. */
 int h3_pdd_schedule_build(h3_sigma_schedule *schedule);

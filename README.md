@@ -137,6 +137,28 @@ dotnet run --project dotnet/src/H3NetRuntime.WebUI -c Release -- --edition gener
 `[h3rt]` 的时间戳是从任务开始计的累计秒数，看某阶段真实耗时要用相邻两行相减，
 或直接看控制台的阶段耗时列。
 
+### HyperFlow 原生采样：4 / 6 / 8 步
+
+HyperFlow H3 Flash 的开源调度（`schedule.py`）只有三套网格，默认是 **6 步**，
+没有 CFG，也没有任意步数。runtime 现在直接用这三套网格；checkpoint 里存的
+`hyperflow_sigmas` 张量不再是「只是个开关」——6 步时会读取张量里的实际 knot
+（与开源网格一致），音频 knot 由同一个 base 用 shift 3 反推。
+
+| WebUI 预设 | 步数 | 说明 |
+|---|---:|---|
+| 极速 `turbo` | 4 | 512×512 / 22 帧，最快 |
+| 均衡 `balanced` | 6 | 864×480 / 56 帧，**开源默认**，所有内置 demo 用它 |
+| 画质 `quality` | 8 | 864×480 / 56 帧，质量档 |
+| 长镜头 `cinematic` | 6 | 864×480 / 124 帧（约 5 秒） |
+
+`Pdd8` 是老 ComfyUI-V8 PDD 适配器的开关，**HyperFlow 权重会忽略它**（原生层
+检测到 `hyperflow_sigmas` 后强制关闭）。ABI 现在也不会再用 `pdd8` 的默认值
+覆盖显式传入的 `steps: 4/6`；只在调用方完全没给步数时才沿用旧的 8 步 PDD 默认值。
+高级版仍可直接填 `Steps`，其它权重包接受 2..1000 步。
+
+与开源实现逐项对照（含尚未移植的部分）见
+[`docs/HYPERFLOW_PARITY.md`](docs/HYPERFLOW_PARITY.md)。
+
 ### 4. 在 C# 里调用
 
 ```bash
@@ -163,7 +185,7 @@ H3GenerateResult clip = await runtime.GenerateAsync(
     new H3GenerateRequest
     {
         Prompt = "A red fox trotting through fresh snow, slow dolly-in, film grain.",
-        Width = 768, Height = 448, Frames = 56, Steps = 8, Seed = 42,
+        Width = 768, Height = 448, Frames = 56, Steps = 6, Seed = 42,
         OutputPath = @"D:\out\fox.mp4"
     },
     progress,
@@ -254,13 +276,14 @@ dotnet run --project dotnet\samples\H3NetRuntime.PackageTest -c Release -- --mod
 直接推导环境变量，适合受限环境。CUDA 12 与发行版 CMake 3.25 的
 `FindCUDAToolkit` 会因已删除的 `CUDA::nvToolsExt` 报错，建议 CMake ≥ 3.31。
 
-实测（RTX 4090 / `sm_89` / CUDA 13.3）：
+实测（RTX 4090 / `sm_89` / CUDA 13.3，HyperFlow 原生 6 步）：
 
 | 场景 | 规格 | 结果 |
 |---|---|---|
-| t2v | 768×448 / 56 帧 / 8 步 | 176.5 s，进度 0.5 → 100% 单调，成片画面连贯 |
-| ref2v | 512×512 / 22 帧 / 8 步、2 张参考图 | 362 s（热缓存），赤狐 + 雪林构图一致 |
-| WebUI | 三种模式 + 全部内置 demo | demo 数量 / 素材载入 / 无 JS 报错 |
+| t2v | 512×512 / 22 帧 / 6 步 | 214 s，进度单调，成片 h264 22 帧 + aac 音频 |
+| fl2v | 512×512 / 22 帧 / 6 步、首帧 + 尾帧 | 约 240 s，成片 272 KB / 22 帧 |
+| ref2v | 512×512 / 22 帧 / 6 步、3 张参考图（49 层剪块） | 约 330 s，成片 221 KB / 22 帧 |
+| 双平台 | Windows (MSVC) 与 WSL Debian 12 (gcc) | `build.cmd 89` / `build.sh 89` 均成功，C 与 .NET smoke 全 PASS |
 
 冷启动主要花在读权重；常驻进程 + `Preload` / 「预热模型」配合默认的
 `KeepDit=true` / `KeepResidentVae=false` 是连续生成的安全用法。注意显存：

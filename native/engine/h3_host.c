@@ -164,14 +164,33 @@ int h3_hyperflow_schedule_build(int steps, h3_sigma_schedule *schedule) {
     if (steps == 4) knots = knots4;
     else if (steps == 6) knots = knots6;
     else if (steps == 8) knots = knots8;
-    if (!schedule || !knots) return 0;
+    if (!schedule || !knots || steps > H3_MAX_STEPS) return 0;
+    float video[H3_MAX_STEPS + 1];
+    for (int index = 0; index < steps; index++) {
+        double base = knots[index];
+        video[index] = (float)(
+            H3_VIDEO_SIGMA_SHIFT * base /
+            (1.0 + (H3_VIDEO_SIGMA_SHIFT - 1.0) * base));
+    }
+    video[steps] = 0.0f;
+    return h3_hyperflow_schedule_from_stored(video, steps, schedule);
+}
+
+int h3_hyperflow_schedule_from_stored(const float *video, int steps,
+                                      h3_sigma_schedule *schedule) {
+    if (!video || !schedule || steps < 1 || steps > H3_MAX_STEPS) return 0;
+    if (fabs(video[0] - 1.0f) > 1e-4f || video[steps] != 0.0f) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = steps;
     for (int index = 0; index < steps; index++) {
-        double base = knots[index];
-        schedule->video[index] = (float)(
-            H3_VIDEO_SIGMA_SHIFT * base /
-            (1.0 + (H3_VIDEO_SIGMA_SHIFT - 1.0) * base));
+        double shifted = video[index];
+        if (!(shifted > 0.0 && shifted <= 1.0 && shifted > video[index + 1]))
+            return 0;
+        /* Undo the video flow shift to recover the raw grid point. */
+        double base = shifted / (H3_VIDEO_SIGMA_SHIFT -
+                                 (H3_VIDEO_SIGMA_SHIFT - 1.0) * shifted);
+        if (!(base >= 0.0 && base <= 1.0)) return 0;
+        schedule->video[index] = (float)shifted;
         schedule->audio[index] = (float)(
             H3_AUDIO_SIGMA_SHIFT * base /
             (1.0 + (H3_AUDIO_SIGMA_SHIFT - 1.0) * base));

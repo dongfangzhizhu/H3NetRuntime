@@ -1402,6 +1402,40 @@ static void h3_vram_preflight(h3_vram_watch *watch) {
  * of which are prompt-independent. */
 #define H3_PRELOAD_TEXT_TOKENS 32
 
+/* HyperFlow checkpoints carry their sampling knots as a small F32 tensor in
+ * the DiT shard. Probing used to be a boolean (`hyperflow_sigmas` present);
+ * read the values too so the released 6-step grid is taken from the
+ * checkpoint rather than duplicated in C. Other step counts keep the
+ * canonical 4/8-step grids from HyperFlow's schedule.py. */
+#define H3_HYPERFLOW_SIGMAS_MAX 8
+typedef struct {
+    int hyperflow;
+    size_t count;
+    float video[H3_HYPERFLOW_SIGMAS_MAX];
+} h3_hyperflow_probe_result;
+
+static h3_hyperflow_probe_result h3_hyperflow_probe(const h3_ctx *ctx) {
+    h3_hyperflow_probe_result result;
+    memset(&result, 0, sizeof(result));
+    char *transformer = h3_path(ctx->model_dir, "FL2VA/transformer");
+    if (!transformer) return result;
+    if (h3_st_dir_has_tensor(transformer, "hyperflow_sigmas")) {
+        result.hyperflow = 1;
+        result.count = h3_st_dir_read_f32(transformer, "hyperflow_sigmas",
+                                         result.video, H3_HYPERFLOW_SIGMAS_MAX);
+    }
+    free(transformer);
+    return result;
+}
+
+static int h3_hyperflow_schedule(const h3_hyperflow_probe_result *probe,
+                                 int steps, h3_sigma_schedule *sigmas) {
+    if (probe->count == (size_t)steps + 1 &&
+        h3_hyperflow_schedule_from_stored(probe->video, steps, sigmas))
+        return 1;
+    return h3_hyperflow_schedule_build(steps, sigmas);
+}
+
 int h3_dit_preload(h3_ctx *ctx, const h3_params *params,
                    char *error, size_t error_size) {
     char detail[512];
@@ -1414,13 +1448,8 @@ int h3_dit_preload(h3_ctx *ctx, const h3_params *params,
     /* Same detection as h3_generate: a HyperFlow checkpoint owns its sampling
      * grid, so warming the PDD shape here would miss the first request. */
     h3_params local = *params;
-    int hyperflow = 0;
-    {
-        char *transformer = h3_path(ctx->model_dir, "FL2VA/transformer");
-        hyperflow = transformer &&
-                    h3_st_dir_has_tensor(transformer, "hyperflow_sigmas");
-        free(transformer);
-    }
+    h3_hyperflow_probe_result probe = h3_hyperflow_probe(ctx);
+    int hyperflow = probe.hyperflow;
     if (hyperflow) {
         local.pdd8 = 0;
         if (local.steps != 4 && local.steps != 6 && local.steps != 8)
@@ -1465,7 +1494,7 @@ int h3_dit_preload(h3_ctx *ctx, const h3_params *params,
     h3_sigma_schedule sigmas;
     memset(&sigmas, 0, sizeof(sigmas));
     int scheduled = params->pdd8 ? h3_pdd_schedule_build(&sigmas) :
-        hyperflow ? h3_hyperflow_schedule_build(params->steps, &sigmas) :
+        hyperflow ? h3_hyperflow_schedule(&probe, params->steps, &sigmas) :
                     h3_serving_schedule_build(params->steps, &sigmas);
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
                            latent_w, temporal.audio_t, temporal.frame_count,
@@ -1533,13 +1562,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
      * per-step PDD heads, so the PDD path cannot run it. Detect it from the
      * checkpoint itself instead of asking the caller to know. */
     h3_params local = *params;
-    int hyperflow = 0;
-    {
-        char *transformer = h3_path(ctx->model_dir, "FL2VA/transformer");
-        hyperflow = transformer &&
-                    h3_st_dir_has_tensor(transformer, "hyperflow_sigmas");
-        free(transformer);
-    }
+    h3_hyperflow_probe_result probe = h3_hyperflow_probe(ctx);
+    int hyperflow = probe.hyperflow;
     if (hyperflow) {
         if (local.pdd8 && !getenv("H3_QUIET"))
             fprintf(stderr, "h3: HyperFlow checkpoint: sampling its own grid "
@@ -2230,7 +2254,7 @@ text_encode_done:
             goto cleanup;
         }
     } else if (hyperflow) {
-        if (!h3_hyperflow_schedule_build(params->steps, &sigmas)) {
+        if (!h3_hyperflow_schedule(&probe, params->steps, &sigmas)) {
             h3_set_error(ctx, "cannot construct the HyperFlow %d-step sigma "
                          "schedule", params->steps);
             goto cleanup;

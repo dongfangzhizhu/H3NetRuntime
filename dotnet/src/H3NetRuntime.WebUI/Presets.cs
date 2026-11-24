@@ -71,26 +71,26 @@ public static class Presets
     {
         new()
         {
-            Id = "turbo", Name = "极速", Description = "512×512 · 22 帧 · 8 步 PDD",
-            Width = 512, Height = 512, Frames = 22, Pdd8 = true, Steps = 8,
-            DitLayers = 45, DenoiseReuse = 1
-        },
-        new()
-        {
-            Id = "balanced", Name = "均衡", Description = "864×480 · 56 帧 · 8 步 PDD",
-            Width = 864, Height = 480, Frames = 56, Pdd8 = true, Steps = 8,
+            Id = "turbo", Name = "极速", Description = "512×512 · 22 帧 · 4 步 HyperFlow",
+            Width = 512, Height = 512, Frames = 22, Pdd8 = false, Steps = 4,
             DitLayers = 50, DenoiseReuse = 1
         },
         new()
         {
-            Id = "quality", Name = "画质", Description = "864×480 · 56 帧 · 20 步完整采样",
-            Width = 864, Height = 480, Frames = 56, Pdd8 = false, Steps = 20,
+            Id = "balanced", Name = "均衡", Description = "864×480 · 56 帧 · 6 步（HyperFlow 官方默认）",
+            Width = 864, Height = 480, Frames = 56, Pdd8 = false, Steps = 6,
             DitLayers = 50, DenoiseReuse = 1
         },
         new()
         {
-            Id = "cinematic", Name = "长镜头", Description = "864×480 · 124 帧（约 5 秒）",
-            Width = 864, Height = 480, Frames = 124, Pdd8 = true, Steps = 8,
+            Id = "quality", Name = "画质", Description = "864×480 · 56 帧 · 8 步 HyperFlow",
+            Width = 864, Height = 480, Frames = 56, Pdd8 = false, Steps = 8,
+            DitLayers = 50, DenoiseReuse = 1
+        },
+        new()
+        {
+            Id = "cinematic", Name = "长镜头", Description = "864×480 · 124 帧（约 5 秒）· 6 步",
+            Width = 864, Height = 480, Frames = 124, Pdd8 = false, Steps = 6,
             DitLayers = 50, DenoiseReuse = 1
         }
     };

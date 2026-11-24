@@ -18,7 +18,7 @@ using var runtime = H3Runtime.Create(new H3RuntimeOptions
 var result = await runtime.GenerateAsync(new H3GenerateRequest
 {
     Prompt = "A red fox walks through fresh snow, camera slowly pushes in.",
-    Width = 864, Height = 480, Frames = 56, Pdd8 = true,
+    Width = 864, Height = 480, Frames = 56, Steps = 6,
     OutputPath = @"D:\out\fox.mp4"
 });
 
@@ -61,6 +61,12 @@ Requests mirror the ComfyUI-V8 workflow: `Prompt`, `Width`/`Height`/`Frames`,
 `ReferenceImages` / `References` (Ref2VA, ordered), plus the engine's speed
 knobs (`DitLayers`, `DenoiseReuse`, `CoreReuse`, `TokenReduction`, `SolAttn`,
 `Fbc`, `SsdStreaming`, `RenderWidth`/`RenderHeight`).
+
+On HyperFlow checkpoints, `Steps` selects the native 4 (fast), 6 (official
+default) or 8 (quality) step grid; `Pdd8` is ignored by those checkpoints and
+no longer overwrites an explicit `Steps`. The 6-step grid is read from the
+checkpoint's `hyperflow_sigmas` tensor. See `docs/HYPERFLOW_PARITY.md` in the
+source repository for the full comparison with the open-source runtime.
 
 ### Per-component model paths
 

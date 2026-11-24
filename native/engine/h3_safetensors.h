@@ -77,5 +77,12 @@ int h3_st_inventory_dir(const char *directory, h3_component_info *info,
  * even for a 16 GiB checkpoint.  Used to pick the sampling schedule a
  * distilled checkpoint was trained on before any weight is loaded. */
 int h3_st_dir_has_tensor(const char *directory, const char *name);
+/* Read a small F32 tensor out of whichever safetensors shard in `directory`
+ * declares it. Returns the number of floats written (0 when the tensor is
+ * absent, not F32, or larger than `max_values`). Used for checkpoint-owned
+ * sampling constants such as `hyperflow_sigmas`; it reads the header plus a
+ * handful of bytes, not the multi-gigabyte weight file. */
+size_t h3_st_dir_read_f32(const char *directory, const char *name,
+                          float *values, size_t max_values);
 
 #endif

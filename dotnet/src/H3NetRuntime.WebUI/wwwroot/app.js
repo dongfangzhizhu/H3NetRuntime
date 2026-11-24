@@ -91,7 +91,7 @@
 
     if (advanced) {
       $('advancedPanel').open = true;
-      $('advSteps').value = 8;
+      $('advSteps').value = 6;
       $('advDitLayers').value = 50;
       $('advDenoiseReuse').value = 1;
       $('advCoreReuse').value = 1;

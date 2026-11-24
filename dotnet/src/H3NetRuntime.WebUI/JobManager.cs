@@ -117,7 +117,13 @@ public sealed class JobManager : IDisposable
         if (steps < 2 || steps > 1000)
             throw new ArgumentException("采样步数必须在 2..1000 之间。");
         if (request.Pdd8 == true && steps != 8)
-            throw new ArgumentException("PDD 8 步蒸馏必须正好 8 步采样。");
+        {
+            // HyperFlow checkpoints sample their own 4/6/8-step grid and ignore
+            // the legacy PDD adaptor. Dropping the flag here keeps the advanced
+            // UI usable when it is left checked from an older configuration;
+            // a real PDD pack still fails in the native validator if steps != 8.
+            request.Pdd8 = false;
+        }
 
         if (mode.Id == GenerationModes.FirstLastFrame)
         {

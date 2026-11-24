@@ -10,6 +10,7 @@
 #include "h3.h"
 #include "h3_config.h"
 #include "h3_host.h"
+#include "h3_safetensors.h"
 #include "h3rt_links.h"
 #include "cJSON.h"
 
@@ -1482,6 +1483,30 @@ char *h3rt_model_info(h3rt_handle *handle) {
     cJSON_AddBoolToObject(json, "composed_pack", handle->composed != 0);
     cJSON_AddBoolToObject(json, "ref2va_available",
                           model->ref2va_transformer.files > 0);
+    /* Expose the checkpoint-owned sampling knots. Header-only read: it costs
+     * a few hundred KiB and lets callers verify which HyperFlow grid they
+     * are actually sampling without loading the 16 GiB transformer. */
+    char transformer_dir[4096];
+    snprintf(transformer_dir, sizeof(transformer_dir), "%s/FL2VA/transformer",
+             handle->pack_dir);
+    float knots[8];
+    size_t knot_count = h3_st_dir_read_f32(transformer_dir, "hyperflow_sigmas",
+                                           knots, 8);
+    if (knot_count >= 2) {
+        cJSON *sampling = cJSON_CreateObject();
+        cJSON *array = cJSON_CreateArray();
+        if (sampling && array) {
+            cJSON_AddBoolToObject(sampling, "hyperflow", 1);
+            cJSON_AddNumberToObject(sampling, "steps", (double)(knot_count - 1));
+            for (size_t i = 0; i < knot_count; i++)
+                cJSON_AddItemToArray(array, cJSON_CreateNumber(knots[i]));
+            cJSON_AddItemToObject(sampling, "checkpoint_sigmas", array);
+            cJSON_AddItemToObject(json, "sampling", sampling);
+        } else {
+            cJSON_Delete(array);
+            cJSON_Delete(sampling);
+        }
+    }
     return h3rt_json_to_string(json);
 }
 
@@ -1541,7 +1566,15 @@ static void h3rt_fill_params(const cJSON *request, int default_keep_dit,
     params.frames = h3rt_int(request, "frames", H3_DEFAULT_FRAMES);
     params.steps = h3rt_int(request, "steps", H3_DEFAULT_STEPS);
     params.seed = h3rt_seed(request, "seed", 42);
-    params.pdd8 = h3rt_bool(request, "pdd8", 1);
+    /* HyperFlow's native grids are 4 / 6 / 8 steps. The legacy default was
+     * pdd8=1 plus a forced 8 steps, which silently overwrote an explicit
+     * `steps: 4` or `steps: 6`. Keep that default when the caller says
+     * nothing (or asks for 8), but honor an explicit short schedule. */
+    const cJSON *steps_item = request ? cJSON_GetObjectItemCaseSensitive(
+                                            request, "steps") : NULL;
+    int explicit_steps = steps_item && cJSON_IsNumber(steps_item);
+    params.pdd8 = h3rt_bool(request, "pdd8",
+                            !explicit_steps || params.steps == 8);
     params.denoise_reuse = h3rt_int(request, "denoise_reuse", 1);
     params.dit_layers = h3rt_int(request, "dit_layers", H3_DEFAULT_DIT_LAYERS);
     params.core_reuse = h3rt_int(request, "core_reuse", 1);

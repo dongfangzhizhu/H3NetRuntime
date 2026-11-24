@@ -185,6 +185,8 @@ public sealed class H3GenerateRequest
     public int? Width { get; set; }
     public int? Height { get; set; }
     public int? Frames { get; set; }
+    /// <summary>Denoising steps. HyperFlow checkpoints support 4 (speed),
+    /// 6 (official default) and 8 (quality); other packs accept 2..1000.</summary>
     public int? Steps { get; set; }
     public ulong? Seed { get; set; }
 
@@ -193,7 +195,8 @@ public sealed class H3GenerateRequest
     public string? FirstFramePath { get; set; }
     public string? LastFramePath { get; set; }
 
-    /// <summary>8-step distilled PDD release (on by default).</summary>
+    /// <summary>Legacy 8-step PDD sampler. HyperFlow checkpoints ignore it and
+    /// use the 4/6/8-step grid selected by <see cref="Steps"/> (default 6).</summary>
     public bool? Pdd8 { get; set; }
     public int? DitLayers { get; set; }
     public int? DenoiseReuse { get; set; }

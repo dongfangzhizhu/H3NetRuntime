@@ -575,6 +575,38 @@ int h3_st_dir_has_tensor(const char *directory, const char *name) {
     return found;
 }
 
+size_t h3_st_dir_read_f32(const char *directory, const char *name,
+                          float *values, size_t max_values) {
+    if (!directory || !name || !*name || !values || !max_values) return 0;
+    DIR *stream = opendir(directory);
+    if (!stream) return 0;
+    size_t count = 0;
+    struct dirent *entry;
+    while (!count && (entry = readdir(stream)) != NULL) {
+        if (entry->d_name[0] == '.' ||
+            !h3_has_suffix(entry->d_name, ".safetensors"))
+            continue;
+        size_t length = strlen(directory) + strlen(entry->d_name) + 2;
+        char *path = malloc(length);
+        if (!path) break;
+        snprintf(path, length, "%s/%s", directory, entry->d_name);
+        h3_st_header header;
+        if (h3_st_read_header(path, &header, NULL, 0)) {
+            const h3_st_tensor *tensor = h3_st_find(&header, name);
+            uint64_t elements = tensor ? h3_st_tensor_elements(tensor) : 0;
+            if (tensor && tensor->dtype == H3_DTYPE_F32 &&
+                elements > 0 && elements <= max_values &&
+                h3_st_read_data(&header, tensor, values,
+                                (size_t)elements * sizeof(float), NULL, 0))
+                count = (size_t)elements;
+            h3_st_free_header(&header);
+        }
+        free(path);
+    }
+    closedir(stream);
+    return count;
+}
+
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size) {
     if (!directory || !info) return 0;
